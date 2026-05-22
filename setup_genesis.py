@@ -350,7 +350,8 @@ def cleanup_temp_files():
 # =====================================================================
 def main():
     # 1. 設定の読み込みとシーン構築
-    config_path = '/home/hogehoge/Documents/so101_MATLAB/env_config.json'
+    # config_path = '/home/hogehoge/Documents/so101_MATLAB/env_config.json'
+    config_path = 'env_config.json'
     env_cfg, cam_fixed_cfg, cam_hand_cfg = load_config(config_path)
     
     urdf_path = '/home/hogehoge/Genesis/examples/robots/so101/so101_new.urdf'

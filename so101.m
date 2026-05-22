@@ -36,7 +36,7 @@ plot_view = [45, 30];
 %% ==========================================================
 %% 2 & 3. ロボット・机・マットの描画
 %% ==========================================================
-fig_main = figure('Name', 'SO-101 Task Environment', 'Color', 'w', 'Position', [100, 100, 900, 700]);
+fig_main = figure('Name', 'SO-101 Task Environment', 'Color', 'w', 'Position', [50, 150, 750, 700]);
 robot = importrobot(urdfPath);
 q_home = homeConfiguration(robot);
 show(robot, q_home, 'PreservePlot', false, 'FastUpdate', true);
@@ -89,19 +89,44 @@ axis equal; grid on; view(plot_view); xlim(plot_xlim); ylim(plot_ylim); zlim(plo
 %% ==========================================================
 %% 6. カメラ視点のシミュレーション（別ウィンドウ）
 %% ==========================================================
+% 変数を初期化（エラー防止）
+f_cam = []; ax_cam = []; robot_cam = [];
+
 if show_cam_view
     f_cam = figure('Name', 'Simulated Camera View', 'Color', 'w', 'MenuBar', 'none', 'ToolBar', 'none', 'Resize', 'off');
     out_pos = get(f_cam, 'OuterPosition'); in_pos = get(f_cam, 'InnerPosition'); 
-    set(f_cam, 'OuterPosition', [1050, 100, 640 + (out_pos(3)-in_pos(3)), 480 + (out_pos(4)-in_pos(4))]);
     
-    % 💡 【超重要修正】MATLABの記憶混同を防ぐため、サブ画面用には「分身」を新しく読み込む！
+    stolen_W = out_pos(3) - in_pos(3);
+    stolen_H = out_pos(4) - in_pos(4);
+    set(f_cam, 'OuterPosition', [870, 150, 640 + stolen_W, 480 + stolen_H]);
+    
     robot_cam = importrobot(urdfPath);
-    show(robot_cam, q_home, 'PreservePlot', false); hold on;
+    show(robot_cam, q_home, 'PreservePlot', false, 'FastUpdate', true); hold on;    
     
     patch('XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.76, 0.65], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
     patch('XData', X_mat, 'YData', Y_mat, 'ZData', Z_mat, 'FaceColor', [0.15 0.15 0.15], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
-    ax = gca; axis equal; axis vis3d; set(ax, 'Units', 'pixels', 'Position', [0 0 640 480]); axis off; 
-    camproj('perspective'); campos([cam_x, cam_y, cam_z]); camtarget([cam_x+cam_dir(1), cam_y+cam_dir(2), cam_z+cam_dir(3)]); camup(cam_up); camva(cam_fov_v_deg); hold off;
+    
+    ax_cam = gca; 
+    axis equal; axis vis3d; set(ax_cam, 'Units', 'pixels', 'Position', [0 0 640 480]); axis off; 
+    
+    camproj('perspective'); 
+    campos([cam_x, cam_y, cam_z]); 
+    camtarget([cam_x+cam_dir(1), cam_y+cam_dir(2), cam_z+cam_dir(3)]); 
+    camup(cam_up); 
+    camva(cam_fov_v_deg); 
+    
+    % ==========================================================
+    % 💡 [NEW] MATLABのお節介オートフォーカスを完全に無効化（ロック）する！
+    % ==========================================================
+    set(ax_cam, 'CameraPositionMode', 'manual', ...
+                'CameraTargetMode', 'manual', ...
+                'CameraUpVectorMode', 'manual', ...
+                'CameraViewAngleMode', 'manual', ...
+                'XLimMode', 'manual', ...
+                'YLimMode', 'manual', ...
+                'ZLimMode', 'manual');
+                
+    hold off;
 end
 
 %% ==========================================================
@@ -125,8 +150,19 @@ while ishandle(fig_main)
         q_current(i).JointPosition = get(sliders(i), 'Value');
     end
     
-    % メイン画面のロボットだけを高速更新（オブジェクト全消去バグを回避！）
+% メイン画面のロボットを更新
     show(robot, q_current, 'Parent', fig_main.CurrentAxes, 'PreservePlot', false, 'FastUpdate', true);
+    
+    % 💡 [追加] カメラ画面が開いていれば、そっちのアームも同期して動かす！
+    if show_cam_view && ishandle(f_cam)
+        show(robot_cam, q_current, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true);
+        
+        % 🚨【最強の解決策】show関数が破壊したカメラ視点を、毎フレーム「上書き」してねじ伏せる！
+        set(ax_cam, 'CameraPosition', [cam_x, cam_y, cam_z], ...
+                    'CameraTarget', [cam_x+cam_dir(1), cam_y+cam_dir(2), cam_z+cam_dir(3)], ...
+                    'CameraUpVector', cam_up, ...
+                    'CameraViewAngle', cam_fov_v_deg);
+    end
     
     T_link = getTransform(robot, q_current, cam_hand_info.attached_link);
     R_link = T_link(1:3, 1:3); P_link = T_link(1:3, 4);
