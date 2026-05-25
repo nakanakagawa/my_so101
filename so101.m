@@ -56,6 +56,12 @@ patch('XData', X_mat, 'YData', Y_mat, 'ZData', Z_mat, 'FaceColor', [0.15 0.15 0.
 %% ==========================================================
 %% 4. 俯瞰カメラの描画
 %% ==========================================================
+% 💡 [NEW] カメラの位置から机の高さ(z_target)まで、垂直な「赤い点線」を下ろす！
+plot3([cam_x, cam_x], [cam_y, cam_y], [z_target, cam_z], 'r--', 'LineWidth', 1.5);
+
+% 💡 [変更] カメラ本体を「四角(rs)」から「丸(ro)」に変更！
+plot3(cam_x, cam_y, cam_z, 'ro', 'MarkerSize', 12, 'MarkerFaceColor', 'r', 'MarkerEdgeColor', 'k', 'LineWidth', 1.5);
+text(cam_x, cam_y, cam_z + 0.04, '📷 固定カメラ', 'Color', 'r', 'FontWeight', 'bold', 'FontSize', 11, 'HorizontalAlignment', 'center');
 pitch = deg2rad(cam_pitch_deg); 
 cam_dir = [cos(pitch), 0, sin(pitch)]; cam_right = [0, -1, 0]; cam_up = [-sin(pitch), 0, cos(pitch)];
 w = tan(deg2rad(cam_fov_h_deg) / 2); h = tan(deg2rad(cam_fov_v_deg) / 2);
@@ -66,7 +72,7 @@ t = (z_target - cam_z) ./ rays(:, 3);
 intersect_pts_fixed = repmat([cam_x, cam_y, cam_z], 4, 1) + t .* rays; 
 poly_fixed = polyshape(intersect_pts_fixed(:,1), intersect_pts_fixed(:,2));
 
-plot3([intersect_pts_fixed(:,1); intersect_pts_fixed(1,1)], [intersect_pts_fixed(:,2); intersect_pts_fixed(1,2)], repmat(z_target+0.001, 5, 1), 'g-', 'LineWidth', 2);
+plot3([intersect_pts_fixed(:,1); intersect_pts_fixed(1,1)], [intersect_pts_fixed(:,2); intersect_pts_fixed(1,2)], repmat(z_target+0.001, 5, 1), 'g-', 'Color','#4646C9' ,'LineWidth', 2);
 
 % 💡 【復活】私が消してしまった水色のピラミッドを再追加！
 faces = [1 2 3; 1 3 4; 1 4 5; 1 5 2];
@@ -94,6 +100,9 @@ hand_frustum_patch = patch('Faces', [1 2 3; 1 3 4; 1 4 5; 1 5 2], ...
                            'FaceColor', [1 0.5 0], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
 
 axis equal; grid on; view(plot_view); xlim(plot_xlim); ylim(plot_ylim); zlim(plot_zlim); hold off;
+
+% 三次元回転を有効にする
+rotate3d(fig_main.CurrentAxes, 'on');
 
 %% ==========================================================
 %% 6. カメラ視点のシミュレーション（別ウィンドウ）
