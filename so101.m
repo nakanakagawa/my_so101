@@ -68,6 +68,11 @@ poly_fixed = polyshape(intersect_pts_fixed(:,1), intersect_pts_fixed(:,2));
 
 plot3([intersect_pts_fixed(:,1); intersect_pts_fixed(1,1)], [intersect_pts_fixed(:,2); intersect_pts_fixed(1,2)], repmat(z_target+0.001, 5, 1), 'g-', 'LineWidth', 2);
 
+% 💡 【復活】私が消してしまった水色のピラミッドを再追加！
+faces = [1 2 3; 1 3 4; 1 4 5; 1 5 2];
+verts_fixed = [[cam_x, cam_y, cam_z]; intersect_pts_fixed];
+patch('Faces', faces, 'Vertices', verts_fixed, 'FaceColor', [0 0.8 1], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
+
 %% ==========================================================
 %% 5. 手先カメラの数学的準備 ＆ 更新用ポリゴンの用意
 %% ==========================================================
@@ -76,13 +81,17 @@ R_json = eul2rotm([y_rad, p_rad, r_rad], 'ZYX');
 R_opt = [1 0 0; 0 0 -1; 0 1 0] * [0 0 -1; 0 1 0; 1 0 0]; 
 R_cam_local = R_json * R_opt;
 offset_local = [cam_hand_info.offset_x; cam_hand_info.offset_y; cam_hand_info.offset_z];
-
 w_h = tan(deg2rad(cam_hand_info.fov_h_deg)/2); h_h = tan(deg2rad(cam_hand_info.fov_v_deg)/2);
 local_rays = [1, -w_h, h_h; 1, w_h, h_h; 1, w_h, -h_h; 1, -w_h, -h_h]';
 
 % リアルタイム更新用のオブジェクトを配置
 poly_patch = patch('XData', [], 'YData', [], 'ZData', [], 'FaceColor', [0, 1.0, 0.5], 'FaceAlpha', 0.85, 'EdgeColor', [0, 1.0, 0.5], 'LineWidth', 2);
 hand_frustum_line = plot3(NaN, NaN, NaN, 'Color', [1 0.5 0], 'LineWidth', 2);
+
+% 💡 [NEW] 手先カメラの3D視野角（ピラミッド型の半透明ポリゴン）を追加！
+hand_frustum_patch = patch('Faces', [1 2 3; 1 3 4; 1 4 5; 1 5 2], ...
+                           'Vertices', zeros(5,3), ...
+                           'FaceColor', [1 0.5 0], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
 
 axis equal; grid on; view(plot_view); xlim(plot_xlim); ylim(plot_ylim); zlim(plot_zlim); hold off;
 
@@ -185,6 +194,9 @@ while ishandle(fig_main)
         hand_pts_closed = [hand_pts; hand_pts(1,:)];
         set(hand_frustum_line, 'XData', hand_pts_closed(:,1), 'YData', hand_pts_closed(:,2), 'ZData', repmat(z_target+0.002, 5, 1));
         
+        % 💡 ピラミッドを描画！
+        set(hand_frustum_patch, 'Vertices', [P_global'; hand_pts]);
+        
         poly_hand = polyshape(hand_pts(:,1), hand_pts(:,2));
         poly_intersect = intersect(poly_fixed, poly_hand);
         
@@ -198,6 +210,9 @@ while ishandle(fig_main)
     else
         set(hand_frustum_line, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
         set(poly_patch, 'XData', [], 'YData', [], 'ZData', []);
+        
+        % 💡 上を向いている時はピラミッドをゼロ座標に潰して隠す
+        set(hand_frustum_patch, 'Vertices', zeros(5,3));
     end
     
     drawnow;
