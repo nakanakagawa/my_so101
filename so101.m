@@ -82,10 +82,12 @@ patch('Faces', faces, 'Vertices', verts_fixed, 'FaceColor', [0 0.8 1], 'FaceAlph
 %% ==========================================================
 %% 5. 手先カメラの数学的準備 ＆ 更新用ポリゴンの用意
 %% ==========================================================
-y_rad = deg2rad(cam_hand_info.yaw_deg); p_rad = deg2rad(cam_hand_info.pitch_deg); r_rad = deg2rad(cam_hand_info.roll_deg);
-R_json = eul2rotm([y_rad, p_rad, r_rad], 'ZYX');
-R_opt = [1 0 0; 0 0 -1; 0 1 0] * [0 0 -1; 0 1 0; 1 0 0]; 
-R_cam_local = R_json * R_opt;
+y_rad = -deg2rad(cam_hand_info.yaw_deg); p_rad = deg2rad(cam_hand_info.pitch_deg); r_rad = deg2rad(cam_hand_info.roll_deg);
+R_json = eul2rotm([y_rad, p_rad, r_rad], 'YZX');
+R_tweak = eul2rotm([pi, 0, 0], 'ZYX');      % パターンB: 左右180度反転（←今コレが一番怪しいです！）
+R_base = [1 0 0; 0 0 -1; 0 1 0] * [0 0 -1; 0 1 0; 1 0 0];
+
+R_opt = R_base * R_tweak;R_cam_local = R_json * R_opt;
 offset_local = [cam_hand_info.offset_x; cam_hand_info.offset_y; cam_hand_info.offset_z];
 w_h = tan(deg2rad(cam_hand_info.fov_h_deg)/2); h_h = tan(deg2rad(cam_hand_info.fov_v_deg)/2);
 local_rays = [1, -w_h, h_h; 1, w_h, h_h; 1, w_h, -h_h; 1, -w_h, -h_h]';
@@ -94,10 +96,13 @@ local_rays = [1, -w_h, h_h; 1, w_h, h_h; 1, w_h, -h_h; 1, -w_h, -h_h]';
 poly_patch = patch('XData', [], 'YData', [], 'ZData', [], 'FaceColor', [0, 1.0, 0.5], 'FaceAlpha', 0.85, 'EdgeColor', [0, 1.0, 0.5], 'LineWidth', 2);
 hand_frustum_line = plot3(NaN, NaN, NaN, 'Color', [1 0.5 0], 'LineWidth', 2);
 
-% 💡 [NEW] 手先カメラの3D視野角（ピラミッド型の半透明ポリゴン）を追加！
+% 💡 [NEW] 手先カメラ本体の目印（オレンジの丸）を配置！
+hand_cam_marker = plot3(NaN, NaN, NaN, 'o', 'MarkerSize', 10, 'MarkerFaceColor', [1 0.5 0], 'MarkerEdgeColor', 'k', 'LineWidth', 1.5);
+
+% 💡 [変更] ピラミッドの輪郭線（EdgeColor）もオレンジにして、空中で見やすくする！
 hand_frustum_patch = patch('Faces', [1 2 3; 1 3 4; 1 4 5; 1 5 2], ...
                            'Vertices', zeros(5,3), ...
-                           'FaceColor', [1 0.5 0], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
+                           'FaceColor', [1 0.5 0], 'FaceAlpha', 0.25, 'EdgeColor', [1 0.5 0], 'LineWidth', 1.5);
 
 axis equal; grid on; view(plot_view); xlim(plot_xlim); ylim(plot_ylim); zlim(plot_zlim); hold off;
 
@@ -182,11 +187,15 @@ while ishandle(fig_main)
                     'CameraViewAngle', cam_fov_v_deg);
     end
     
+    % 3. 手先カメラの順運動学
     T_link = getTransform(robot, q_current, cam_hand_info.attached_link);
     R_link = T_link(1:3, 1:3); P_link = T_link(1:3, 4);
     P_global = P_link + R_link * offset_local;
     R_global = R_link * R_cam_local;
     global_rays = R_global * local_rays;
+    
+    % 💡 [NEW] 手先カメラの丸い目印を現在位置（P_global）に移動！
+    set(hand_cam_marker, 'XData', P_global(1), 'YData', P_global(2), 'ZData', P_global(3));
     
     hand_pts = zeros(4, 3);
     is_looking_down = true;
@@ -200,10 +209,10 @@ while ishandle(fig_main)
     end
     
     if is_looking_down
+        % --- 視野が机に届いている時 ---
         hand_pts_closed = [hand_pts; hand_pts(1,:)];
         set(hand_frustum_line, 'XData', hand_pts_closed(:,1), 'YData', hand_pts_closed(:,2), 'ZData', repmat(z_target+0.002, 5, 1));
         
-        % 💡 ピラミッドを描画！
         set(hand_frustum_patch, 'Vertices', [P_global'; hand_pts]);
         
         poly_hand = polyshape(hand_pts(:,1), hand_pts(:,2));
@@ -217,11 +226,16 @@ while ishandle(fig_main)
             set(poly_patch, 'XData', [], 'YData', [], 'ZData', []); 
         end
     else
+        % --- 💡 [NEW] 視野が机に向いていない時（上や横を向いている時） ---
+        % ピラミッドを消すのではなく、「0.5m先まで広がる空中のピラミッド」として描画する！
+        for i = 1:4
+            hand_pts(i, :) = (P_global + 0.5 * global_rays(:, i))';
+        end
+        set(hand_frustum_patch, 'Vertices', [P_global'; hand_pts]);
+        
+        % 机の上の枠線や緑のポリゴンはぶつかっていないので消す
         set(hand_frustum_line, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
         set(poly_patch, 'XData', [], 'YData', [], 'ZData', []);
-        
-        % 💡 上を向いている時はピラミッドをゼロ座標に潰して隠す
-        set(hand_frustum_patch, 'Vertices', zeros(5,3));
     end
     
     drawnow;
