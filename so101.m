@@ -43,8 +43,8 @@ rotate3d(fig_main.CurrentAxes, 'on');
 %% ==========================================================
 %% 6. 別ウィンドウ（固定カメラ視点・手先カメラ視点）の初期化
 %% ==========================================================
-% 💡 [関数化] カメラシミュレーションウィンドウの生成
-[f_cam, ax_cam, robot_cam, f_cam_hand, ax_cam_hand, robot_cam_hand] = init_camera_views(...
+% 💡 [変更] 上下分割の1つのウィンドウにまとめる！
+[f_cams, ax_cam, robot_cam, ax_cam_hand, robot_cam_hand] = init_camera_views(...
     show_cam_view, urdfPath, q_home, env, cam_info, cam_dir, cam_up, cam_hand_info);
 
 %% ==========================================================
@@ -74,14 +74,6 @@ while ishandle(fig_main)
     % メイン画面のロボットを更新
     show(robot, q_current, 'Parent', fig_main.CurrentAxes, 'PreservePlot', false, 'FastUpdate', true);
     
-    % 固定カメラ画面のロボットと視点を同期更新
-    if show_cam_view && ishandle(f_cam)
-        show(robot_cam, q_current, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true);
-        set(ax_cam, 'CameraPosition', [cam_info.x, cam_info.y, cam_info.z], ...
-                    'CameraTarget', [cam_info.x+cam_dir(1), cam_info.y+cam_dir(2), cam_info.z+cam_dir(3)], ...
-                    'CameraUpVector', cam_up, 'CameraViewAngle', cam_info.fov_v_deg);
-    end
-    
     % 手先カメラの順運動学計算
     T_link = getTransform(robot, q_current, cam_hand_info.attached_link);
     R_link = T_link(1:3, 1:3); P_link = T_link(1:3, 4);
@@ -89,8 +81,15 @@ while ishandle(fig_main)
     R_global = R_link * R_cam_local;
     global_rays = R_global * local_rays;
 
-    % 手先カメラ画面（FPV）のロボットと視点を同期更新
-    if show_cam_view && ishandle(f_cam_hand)
+    % 💡 [修正] f_cam の古いコードを削除し、f_cams のブロック1つに完全統合！
+    if show_cam_view && ishandle(f_cams)
+        % 👆 上半分：固定カメラの更新
+        show(robot_cam, q_current, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true);
+        set(ax_cam, 'CameraPosition', [cam_info.x, cam_info.y, cam_info.z], ...
+                    'CameraTarget', [cam_info.x+cam_dir(1), cam_info.y+cam_dir(2), cam_info.z+cam_dir(3)], ...
+                    'CameraUpVector', cam_up, 'CameraViewAngle', cam_info.fov_v_deg);
+        
+        % 👇 下半分：手先カメラ(FPV)の更新
         show(robot_cam_hand, q_current, 'Parent', ax_cam_hand, 'PreservePlot', false, 'FastUpdate', true);
         cam_dir_hand = R_global * [1; 0; 0];
         cam_up_hand  = R_global * [0; 0; 1]; 
@@ -102,7 +101,7 @@ while ishandle(fig_main)
     set(handles.hand_cam_marker, 'XData', P_global(1), 'YData', P_global(2), 'ZData', P_global(3));
     set(handles.hand_drop_line, 'XData', [P_global(1), P_global(1)], 'YData', [P_global(2), P_global(2)], 'ZData', [P_global(3), z_target]);
 
-    % 💡 [関数化] 幾何学的な視野の重なり・凸包ポリゴンを計算して画面を更新
+    % 幾何学的な視野の重なり・凸包ポリゴンを計算して画面を更新
     update_camera_projections(P_global, global_rays, z_target, env, poly_fixed, handles);
     
     drawnow;
@@ -204,10 +203,9 @@ function [R_cam_local, offset_local, local_rays, fov_v] = setup_hand_camera_geom
     fov_v = cam_hand_info.fov_v_deg;
 end
 
-
-function [f_cam, ax_cam, robot_cam, f_cam_hand, ax_cam_hand, robot_cam_hand] = init_camera_views(show_cam_view, urdfPath, q_home, env, cam_info, cam_dir, cam_up, cam_hand_info)
-    % 別ウィンドウ（固定カメラと手先カメラの視野映像）を生成・初期化する関数
-    f_cam = []; ax_cam = []; robot_cam = []; f_cam_hand = []; ax_cam_hand = []; robot_cam_hand = [];
+function [f_cams, ax_cam, robot_cam, ax_cam_hand, robot_cam_hand] = init_camera_views(show_cam_view, urdfPath, q_home, env, cam_info, cam_dir, cam_up, cam_hand_info)
+    % 縦に並べた統合カメラウィンドウを生成する関数
+    f_cams = []; ax_cam = []; robot_cam = []; ax_cam_hand = []; robot_cam_hand = [];
     if ~show_cam_view, return; end
 
     X_desk = [env.desk_x_min, env.desk_x_max, env.desk_x_max, env.desk_x_min];
@@ -217,36 +215,52 @@ function [f_cam, ax_cam, robot_cam, f_cam_hand, ax_cam_hand, robot_cam_hand] = i
     Y_mat = [env.mat_y_start, env.mat_y_start, env.mat_y_start + env.mat_width, env.mat_y_start + env.mat_width];
     Z_mat = repmat(env.desk_z_offset + env.mat_z_offset, 1, 4);
 
-    % --- 1. 固定カメラウィンドウ ---
-    f_cam = figure('Name', 'Simulated Camera View', 'Color', 'w', 'MenuBar', 'none', 'ToolBar', 'none', 'Resize', 'off');
-    out_pos = get(f_cam, 'OuterPosition'); in_pos = get(f_cam, 'InnerPosition'); 
-    stolen_W = out_pos(3) - in_pos(3); stolen_H = out_pos(4) - in_pos(4);
-    set(f_cam, 'OuterPosition', [870, 150, 640 + stolen_W, 480 + stolen_H]);
-    
+    % ==========================================================
+    % 💡 [変更] ウィンドウを一回り縮小（480 × 720）※比率は4:3を完全キープ！
+    % ==========================================================
+    f_cams = figure('Name', 'Camera Views (Top: Fixed, Bottom: FPV)', 'Color', 'w', 'MenuBar', 'none', 'ToolBar', 'none', 'Resize', 'off');
+    set(f_cams, 'Position', [850, 100, 480, 720]);
+
+    % ==========================================================
+    % 💡 [変更] パネルに「タイトル（見出し）」と「境界線(line)」を追加！
+    % ==========================================================
+    pnl_top = uipanel('Parent', f_cams, 'Position', [0, 0.5, 1.0, 0.5], ...
+                      'BackgroundColor', 'w', 'BorderType', 'line', ...
+                      'Title', ' 📷 固定カメラ ', 'FontSize', 11, 'FontWeight', 'bold');
+                      
+    pnl_bot = uipanel('Parent', f_cams, 'Position', [0, 0.0, 1.0, 0.5], ...
+                      'BackgroundColor', 'w', 'BorderType', 'line', ...
+                      'Title', ' 🦾 手先カメラ (FPV) ', 'FontSize', 11, 'FontWeight', 'bold');
+
+    % --- 👆 上半分: 固定カメラ ---
+    ax_cam = axes('Parent', pnl_top, 'Position', [0, 0, 1, 1]); 
     robot_cam = importrobot(urdfPath);
-    show(robot_cam, q_home, 'PreservePlot', false, 'FastUpdate', true); hold on;    
-    patch('XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.76, 0.65], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
-    patch('XData', X_mat, 'YData', Y_mat, 'ZData', Z_mat, 'FaceColor', [0.15 0.15 0.15], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
-    ax_cam = gca; axis equal; axis vis3d; set(ax_cam, 'Units', 'pixels', 'Position', [0 0 640 480]); axis off; 
+    show(robot_cam, q_home, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true); 
+    hold(ax_cam, 'on');    
+    
+    patch('Parent', ax_cam, 'XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.76, 0.65], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
+    patch('Parent', ax_cam, 'XData', X_mat, 'YData', Y_mat, 'ZData', Z_mat, 'FaceColor', [0.15 0.15 0.15], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
+    
+    axis(ax_cam, 'equal'); axis(ax_cam, 'vis3d'); axis(ax_cam, 'off'); 
+    axes(ax_cam); % 現在の軸としてセット
     camproj('perspective'); campos([cam_info.x, cam_info.y, cam_info.z]); 
     camtarget([cam_info.x+cam_dir(1), cam_info.y+cam_dir(2), cam_info.z+cam_dir(3)]); camup(cam_up); camva(cam_info.fov_v_deg); 
     set(ax_cam, 'CameraPositionMode', 'manual', 'CameraTargetMode', 'manual', 'CameraUpVectorMode', 'manual', 'CameraViewAngleMode', 'manual', 'XLimMode', 'manual', 'YLimMode', 'manual', 'ZLimMode', 'manual');
-    hold off;
 
-    % --- 2. 手先カメラウィンドウ (FPV) ---
-    f_cam_hand = figure('Name', 'Hand Camera View (FPV)', 'Color', 'w', 'MenuBar', 'none', 'ToolBar', 'none', 'Resize', 'off');
-    set(f_cam_hand, 'OuterPosition', [1520, 150, 640 + stolen_W, 480 + stolen_H]);
-    
+    % --- 👇 下半分: 手先カメラ ---
+    ax_cam_hand = axes('Parent', pnl_bot, 'Position', [0, 0, 1, 1]); 
     robot_cam_hand = importrobot(urdfPath);
-    show(robot_cam_hand, q_home, 'PreservePlot', false, 'FastUpdate', true); hold on;    
-    patch('XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.76, 0.65], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
-    patch('XData', X_mat, 'YData', Y_mat, 'ZData', Z_mat, 'FaceColor', [0.15 0.15 0.15], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
-    ax_cam_hand = gca; axis equal; axis vis3d; set(ax_cam_hand, 'Units', 'pixels', 'Position', [0 0 640 480]); axis off; 
+    show(robot_cam_hand, q_home, 'Parent', ax_cam_hand, 'PreservePlot', false, 'FastUpdate', true); 
+    hold(ax_cam_hand, 'on');    
+    
+    patch('Parent', ax_cam_hand, 'XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.76, 0.65], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
+    patch('Parent', ax_cam_hand, 'XData', X_mat, 'YData', Y_mat, 'ZData', Z_mat, 'FaceColor', [0.15 0.15 0.15], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
+    
+    axis(ax_cam_hand, 'equal'); axis(ax_cam_hand, 'vis3d'); axis(ax_cam_hand, 'off'); 
+    axes(ax_cam_hand); % 現在の軸としてセット
     camproj('perspective'); camva(cam_hand_info.fov_v_deg); 
     set(ax_cam_hand, 'CameraPositionMode', 'manual', 'CameraTargetMode', 'manual', 'CameraUpVectorMode', 'manual', 'CameraViewAngleMode', 'manual', 'XLimMode', 'manual', 'YLimMode', 'manual', 'ZLimMode', 'manual');
-    hold off;
 end
-
 
 function update_camera_projections(P_global, global_rays, z_target, env, poly_fixed, handles)
     % 毎フレーム呼び出され、幾何学的な視野交差・凸包・型抜き・重なり面を描画更新する関数
