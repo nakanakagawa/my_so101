@@ -50,7 +50,10 @@ patch('XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.7
 X_mat = [mat_x_start, mat_x_start + mat_length, mat_x_start + mat_length, mat_x_start];
 Y_mat = [mat_y_start, mat_y_start, mat_y_start + mat_width, mat_y_start + mat_width];
 z_target = desk_z_offset + mat_z_offset;
-Z_mat = repmat(z_target, 1, 4);
+
+% 💡【修正】机の表面と完全に重なって消えるのを防ぐため、1ミリ(+0.001)だけ浮かせる！
+Z_mat = repmat(z_target + 0.004, 1, 4);
+
 patch('XData', X_mat, 'YData', Y_mat, 'ZData', Z_mat, 'FaceColor', [0.15 0.15 0.15], 'FaceAlpha', 0.9, 'EdgeColor', 'k');
 
 %% ==========================================================
@@ -73,6 +76,7 @@ intersect_pts_fixed = repmat([cam_x, cam_y, cam_z], 4, 1) + t .* rays;
 poly_fixed = polyshape(intersect_pts_fixed(:,1), intersect_pts_fixed(:,2));
 
 plot3([intersect_pts_fixed(:,1); intersect_pts_fixed(1,1)], [intersect_pts_fixed(:,2); intersect_pts_fixed(1,2)], repmat(z_target+0.001, 5, 1), 'g-', 'Color','#4646C9' ,'LineWidth', 2);
+patch('XData', intersect_pts_fixed(:,1), 'YData', intersect_pts_fixed(:,2), 'ZData', repmat(z_target+0.008, 4, 1), 'FaceColor', '#4646C9', 'FaceAlpha', 0.15, 'EdgeColor', 'none');
 
 % 💡 【復活】私が消してしまった水色のピラミッドを再追加！
 faces = [1 2 3; 1 3 4; 1 4 5; 1 5 2];
@@ -98,6 +102,12 @@ hand_frustum_line = plot3(NaN, NaN, NaN, 'Color', [1 0.5 0], 'LineWidth', 2);
 
 % 💡 [NEW] 手先カメラ本体の目印（オレンジの丸）を配置！
 hand_cam_marker = plot3(NaN, NaN, NaN, 'o', 'MarkerSize', 10, 'MarkerFaceColor', [1 0.5 0], 'MarkerEdgeColor', 'k', 'LineWidth', 1.5);
+
+% 手先カメラから机に垂直に落ちる点線
+hand_drop_line = plot3(NaN, NaN, NaN, '--', 'Color', [1 0.5 0], 'LineWidth', 1.5);
+
+% 手先カメラの机の上の「投影面（かぶっている部分）」を薄いオレンジで塗りつぶすパッチ
+hand_footprint_patch = patch('XData', [], 'YData', [], 'ZData', [], 'FaceColor', [1 0.5 0], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
 
 % 💡 [変更] ピラミッドの輪郭線（EdgeColor）もオレンジにして、空中で見やすくする！
 hand_frustum_patch = patch('Faces', [1 2 3; 1 3 4; 1 4 5; 1 5 2], ...
@@ -197,44 +207,80 @@ while ishandle(fig_main)
     % 💡 [NEW] 手先カメラの丸い目印を現在位置（P_global）に移動！
     set(hand_cam_marker, 'XData', P_global(1), 'YData', P_global(2), 'ZData', P_global(3));
     
+    set(hand_drop_line, 'XData', [P_global(1), P_global(1)], 'YData', [P_global(2), P_global(2)], 'ZData', [P_global(3), z_target]);
+
     hand_pts = zeros(4, 3);
-    is_looking_down = true;
+    
+    MAX_DIST = 2.0; % 視野を「長さ2mのピラミッド立体」とする
+    F = zeros(4, 3);
     for i = 1:4
-        if global_rays(3, i) < -1e-4
-            t_hand = (z_target - P_global(3)) / global_rays(3, i);
-            hand_pts(i, :) = (P_global + t_hand * global_rays(:, i))';
-        else
-            is_looking_down = false;
+        F(i, :) = (P_global + MAX_DIST * global_rays(:, i))';
+    end
+    
+    % 💡 空中のピラミッドは常時更新
+    set(hand_frustum_patch, 'Vertices', [P_global'; F]);
+    
+    % ピラミッドを構成する8本の辺（側面4本、底面4本）
+    edges = [
+        P_global', F(1,:);  P_global', F(2,:);
+        P_global', F(3,:);  P_global', F(4,:);
+        F(1,:), F(2,:);     F(2,:), F(3,:);
+        F(3,:), F(4,:);     F(4,:), F(1,:)
+    ];
+    
+    footprint_pts = [];
+    % 8本の辺それぞれについて、机(z_target)を貫通しているかチェック
+    for i = 1:8
+        p1 = edges(i, 1:3); p2 = edges(i, 4:6);
+        if (p1(3) - z_target) * (p2(3) - z_target) <= 1e-6 
+            if abs(p2(3) - p1(3)) > 1e-6 % ゼロ除算回避
+                t_cross = (z_target - p1(3)) / (p2(3) - p1(3));
+                % 辺の線分上で交差している場合のみ点を追加
+                if t_cross >= -0.01 && t_cross <= 1.01
+                    cross_pt = p1 + t_cross * (p2 - p1);
+                    footprint_pts = [footprint_pts; cross_pt(1:2)];
+                end
+            end
         end
     end
     
-    if is_looking_down
-        % --- 視野が机に届いている時 ---
-        hand_pts_closed = [hand_pts; hand_pts(1,:)];
-        set(hand_frustum_line, 'XData', hand_pts_closed(:,1), 'YData', hand_pts_closed(:,2), 'ZData', repmat(z_target+0.002, 5, 1));
+    % 机にぶつかった点が3つ以上あれば、図形を描画！
+    if size(footprint_pts, 1) >= 3
+        % 輪ゴムアルゴリズムで点群を包み込む
+        k = convhull(footprint_pts(:,1), footprint_pts(:,2));
+        hull_pts = footprint_pts(k, :);
+        poly_hull = polyshape(hull_pts(:,1), hull_pts(:,2));
         
-        set(hand_frustum_patch, 'Vertices', [P_global'; hand_pts]);
+        % 💡 [NEW] 2m先まで伸びた巨大ポリゴンを「机のサイズ」で型抜きしてカット！（Zファイティング防止）
+        poly_desk = polyshape(X_desk, Y_desk);
+        poly_hand = intersect(poly_hull, poly_desk);
         
-        poly_hand = polyshape(hand_pts(:,1), hand_pts(:,2));
-        poly_intersect = intersect(poly_fixed, poly_hand);
-        
-        if poly_intersect.NumRegions > 0
-            v = poly_intersect.Vertices;
-            v(isnan(v(:,1)), :) = []; 
-            set(poly_patch, 'XData', v(:,1), 'YData', v(:,2), 'ZData', repmat(z_target+0.003, size(v,1), 1));
+        if poly_hand.NumRegions > 0
+            v_hand = poly_hand.Vertices;
+            v_hand(isnan(v_hand(:,1)), :) = []; % 切れ目(NaN)を除去
+            
+            % 💡 [変更] 手先カメラのオレンジ枠と塗りは「12ミリ(0.012)」浮かせる！
+            set(hand_frustum_line, 'XData', [v_hand(:,1); v_hand(1,1)], 'YData', [v_hand(:,2); v_hand(1,2)], 'ZData', repmat(z_target+0.012, size(v_hand,1)+1, 1));
+            set(hand_footprint_patch, 'XData', v_hand(:,1), 'YData', v_hand(:,2), 'ZData', repmat(z_target+0.012, size(v_hand,1), 1));
+            poly_intersect = intersect(poly_fixed, poly_hand);
+            
+            if poly_intersect.NumRegions > 0
+                v_int = poly_intersect.Vertices;
+                v_int(isnan(v_int(:,1)), :) = [];
+                % 💡 [変更] 重なっている緑の部分は最上階の「16ミリ(0.016)」にする！
+                set(poly_patch, 'XData', v_int(:,1), 'YData', v_int(:,2), 'ZData', repmat(z_target+0.016, size(v_int,1), 1)); 
+            else
+                set(poly_patch, 'XData', [], 'YData', [], 'ZData', []); 
+            end
         else
-            set(poly_patch, 'XData', [], 'YData', [], 'ZData', []); 
+            set(hand_frustum_line, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
+            set(hand_footprint_patch, 'XData', [], 'YData', [], 'ZData', []);
+            set(poly_patch, 'XData', [], 'YData', [], 'ZData', []);
         end
     else
-        % --- 💡 [NEW] 視野が机に向いていない時（上や横を向いている時） ---
-        % ピラミッドを消すのではなく、「0.5m先まで広がる空中のピラミッド」として描画する！
-        for i = 1:4
-            hand_pts(i, :) = (P_global + 0.5 * global_rays(:, i))';
-        end
-        set(hand_frustum_patch, 'Vertices', [P_global'; hand_pts]);
-        
-        % 机の上の枠線や緑のポリゴンはぶつかっていないので消す
+        % 机と交差していない場合は枠線などを消す
         set(hand_frustum_line, 'XData', NaN, 'YData', NaN, 'ZData', NaN);
+        set(hand_footprint_patch, 'XData', [], 'YData', [], 'ZData', []);
         set(poly_patch, 'XData', [], 'YData', [], 'ZData', []);
     end
     
