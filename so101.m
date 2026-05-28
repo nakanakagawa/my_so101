@@ -72,7 +72,7 @@ while ishandle(fig_main)
     end
     
     % メイン画面のロボットを更新
-    show(robot, q_current, 'Parent', fig_main.CurrentAxes, 'PreservePlot', false, 'FastUpdate', true);
+    show(robot, q_current, 'Parent', fig_main.CurrentAxes, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
     
     % 手先カメラの順運動学計算
     T_link = getTransform(robot, q_current, cam_hand_info.attached_link);
@@ -84,13 +84,13 @@ while ishandle(fig_main)
     % 💡 [修正] f_cam の古いコードを削除し、f_cams のブロック1つに完全統合！
     if show_cam_view && ishandle(f_cams)
         % 👆 上半分：固定カメラの更新
-        show(robot_cam, q_current, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true);
+        show(robot_cam, q_current, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
         set(ax_cam, 'CameraPosition', [cam_info.x, cam_info.y, cam_info.z], ...
                     'CameraTarget', [cam_info.x+cam_dir(1), cam_info.y+cam_dir(2), cam_info.z+cam_dir(3)], ...
                     'CameraUpVector', cam_up, 'CameraViewAngle', cam_info.fov_v_deg);
         
         % 👇 下半分：手先カメラ(FPV)の更新
-        show(robot_cam_hand, q_current, 'Parent', ax_cam_hand, 'PreservePlot', false, 'FastUpdate', true);
+        show(robot_cam_hand, q_current, 'Parent', ax_cam_hand, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
         cam_dir_hand = R_global * [1; 0; 0];
         cam_up_hand  = R_global * [0; 0; 1]; 
         set(ax_cam_hand, 'CameraPosition', P_global', 'CameraTarget', (P_global + cam_dir_hand)', ...
@@ -132,7 +132,7 @@ function [robot, q_home, fig_main, poly_fixed, cam_dir, cam_up] = create_main_en
     fig_main = figure('Name', 'SO-101 Task Environment', 'Color', 'w', 'Position', [50, 150, 750, 700]);
     robot = importrobot(urdfPath);
     q_home = homeConfiguration(robot);
-    show(robot, q_home, 'PreservePlot', false, 'FastUpdate', true);
+    show(robot, q_home, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
     hold on;
 
     % 机の描画
@@ -235,7 +235,7 @@ function [f_cams, ax_cam, robot_cam, ax_cam_hand, robot_cam_hand] = init_camera_
     % --- 👆 上半分: 固定カメラ ---
     ax_cam = axes('Parent', pnl_top, 'Position', [0, 0, 1, 1]); 
     robot_cam = importrobot(urdfPath);
-    show(robot_cam, q_home, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true); 
+    show(robot_cam, q_home, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off'); 
     hold(ax_cam, 'on');    
     
     patch('Parent', ax_cam, 'XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.76, 0.65], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
@@ -250,7 +250,7 @@ function [f_cams, ax_cam, robot_cam, ax_cam_hand, robot_cam_hand] = init_camera_
     % --- 👇 下半分: 手先カメラ ---
     ax_cam_hand = axes('Parent', pnl_bot, 'Position', [0, 0, 1, 1]); 
     robot_cam_hand = importrobot(urdfPath);
-    show(robot_cam_hand, q_home, 'Parent', ax_cam_hand, 'PreservePlot', false, 'FastUpdate', true); 
+    show(robot_cam_hand, q_home, 'Parent', ax_cam_hand, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off'); 
     hold(ax_cam_hand, 'on');    
     
     patch('Parent', ax_cam_hand, 'XData', X_desk, 'YData', Y_desk, 'ZData', Z_desk, 'FaceColor', [0.85, 0.76, 0.65], 'FaceAlpha', 1.0, 'EdgeColor', 'none');
@@ -340,3 +340,4 @@ function clear_projections(handles)
     set(handles.hand_footprint_patch, 'XData', [], 'YData', [], 'ZData', []);
     set(handles.poly_patch, 'XData', [], 'YData', [], 'ZData', []); 
 end
+
