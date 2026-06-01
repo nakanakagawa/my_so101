@@ -2,7 +2,7 @@ function so101_3d_simulator()
 % SO-101 模倣学習環境 3Dシミュレータ (完全統合・関数カプセル化版)
 clc; close all;
 
-% カメラの視野範囲を示すやつ
+% ロボットアームを動かせるやつ
 
 %% 1. 全体設定 ＆ 設定ファイルの読み込み
 
@@ -37,7 +37,7 @@ handles.hand_footprint_patch = patch('XData', [], 'YData', [], 'ZData', [], 'Fac
 handles.hand_frustum_patch = patch('Faces', [1 2 3; 1 3 4; 1 4 5; 1 5 2], 'Vertices', zeros(5,3), 'FaceColor', [1 0.5 0], 'FaceAlpha', 0.25, 'EdgeColor', [1 0.5 0], 'LineWidth', 1.5);
 
 hold off;
-rotate3d(fig_main.CurrentAxes, 'on');
+% rotate3d(fig_main.CurrentAxes, 'on');
 
 %% 6. 別ウィンドウ（固定カメラ視点・手先カメラ視点）の初期化
 
@@ -45,63 +45,99 @@ rotate3d(fig_main.CurrentAxes, 'on');
 [f_cams, ax_cam, robot_cam, ax_cam_hand, robot_cam_hand] = init_camera_views(...
     show_cam_view, urdfPath, q_home, env, cam_info, cam_dir, cam_up, cam_hand_info);
 
-%% 7. 実行後のインタラクティブ操作（メインループ）
-
+%% ==========================================================
+%% 7. 実行後のインタラクティブ操作（完全自作アルゴリズム版）
+%% ==========================================================
 figure(fig_main);
-pnl = uipanel(fig_main, 'Position', [0, 0, 1, 0.15], 'Title', 'Joint Controls (順運動学)', 'BackgroundColor', 'w');
-sliders = gobjects(6, 1);
-for i = 1:6
-    sliders(i) = uicontrol(pnl, 'Style', 'slider', 'Min', -pi, 'Max', pi, 'Value', q_home(i).JointPosition, ...
-        'Units', 'normalized', 'Position', [0.02 + (i-1)*0.16, 0.2, 0.12, 0.4]);
-    uicontrol(pnl, 'Style', 'text', 'String', sprintf('J%d', i), 'BackgroundColor', 'w', ...
-        'Units', 'normalized', 'Position', [0.02 + (i-1)*0.16, 0.6, 0.12, 0.3]);
+
+pnl = uipanel(fig_main, 'Position', [0, 0, 1, 0.15], 'BackgroundColor', 'w', 'BorderType', 'line');
+uicontrol(pnl, 'Style', 'text', 'String', '🎮 幾何学制御モード (安定版)', 'Position', [10, 60, 200, 20], 'FontSize', 11, 'FontWeight', 'bold', 'BackgroundColor', 'w');
+uicontrol(pnl, 'Style', 'text', 'String', '[W/S]: 伸ばす/引く  |  [A/D]: 左右旋回  |  [Q/E]: 上昇/降下', 'Position', [10, 20, 450, 30], 'FontSize', 12, 'BackgroundColor', 'w');
+
+disp('🎮 メインウィンドウをクリックして選択してから、W/A/S/D/Q/E キーを押してください。');
+
+z_target = env.desk_z_offset + env.mat_z_offset;
+
+% 状態保存用のデータ構造体（極座標）
+data = struct();
+data.r = 0.20;       % 初期の根本からの距離 (20cm)
+data.theta = 0.0;    % 初期の旋回角度 (正面)
+data.z_grasp = z_target + 0.01;   
+data.z_transit = z_target + 0.05; 
+data.current_z = data.z_transit;                     
+data.target_z = data.z_transit;                      
+fig_main.UserData = data;
+
+set(fig_main, 'WindowKeyPressFcn', @(src, event) handle_keyboard_input(fig_main, event));
+if ishandle(f_cams)
+    set(f_cams, 'WindowKeyPressFcn', @(src, event) handle_keyboard_input(fig_main, event));
 end
 
-disp('🎮 インタラクティブモード開始！メインウィンドウのスライダーを動かしてください。');
-
 q_current = q_home;
-z_target = env.desk_z_offset + env.mat_z_offset;
 
 % --- リアルタイムループ ---
 while ishandle(fig_main)
+    data = fig_main.UserData;
+    
+    % Z軸の滑らかな昇降
+    dz = data.target_z - data.current_z;
+    if abs(dz) > 0.005
+        data.current_z = data.current_z + sign(dz) * 0.005; 
+    else
+        data.current_z = data.target_z; 
+    end
+    fig_main.UserData = data; 
+    
+    % 🚨 ここが魔法の1行！自作関数で6つの関節角度を一瞬で計算！
+    calculated_angles = solve_geometric_ik(data.r, data.theta, data.current_z);
+    
+    % 計算結果をロボットの関節データに直接流し込む
     for i = 1:6
-        q_current(i).JointPosition = get(sliders(i), 'Value');
+        q_current(i).JointPosition = calculated_angles(i);
     end
     
-    % メイン画面のロボットを更新
+    % --- 以下は描画更新処理 ---
     show(robot, q_current, 'Parent', fig_main.CurrentAxes, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
     
-    % 手先カメラの順運動学計算
     T_link = getTransform(robot, q_current, cam_hand_info.attached_link);
     R_link = T_link(1:3, 1:3); P_link = T_link(1:3, 4);
     P_global = P_link + R_link * offset_local;
     R_global = R_link * R_cam_local;
     global_rays = R_global * local_rays;
 
-    % 💡 [修正] f_cam の古いコードを削除し、f_cams のブロック1つに完全統合！
     if show_cam_view && ishandle(f_cams)
-        % 👆 上半分：固定カメラの更新
         show(robot_cam, q_current, 'Parent', ax_cam, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
-        set(ax_cam, 'CameraPosition', [cam_info.x, cam_info.y, cam_info.z], ...
-                    'CameraTarget', [cam_info.x+cam_dir(1), cam_info.y+cam_dir(2), cam_info.z+cam_dir(3)], ...
-                    'CameraUpVector', cam_up, 'CameraViewAngle', cam_info.fov_v_deg);
-        
-        % 👇 下半分：手先カメラ(FPV)の更新
         show(robot_cam_hand, q_current, 'Parent', ax_cam_hand, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
+        
         cam_dir_hand = R_global * [1; 0; 0];
         cam_up_hand  = R_global * [0; 0; 1]; 
         set(ax_cam_hand, 'CameraPosition', P_global', 'CameraTarget', (P_global + cam_dir_hand)', ...
                          'CameraUpVector', cam_up_hand', 'CameraViewAngle', cam_hand_fov_v);
     end
     
-    % マーカーと垂直点線の位置更新
     set(handles.hand_cam_marker, 'XData', P_global(1), 'YData', P_global(2), 'ZData', P_global(3));
     set(handles.hand_drop_line, 'XData', [P_global(1), P_global(1)], 'YData', [P_global(2), P_global(2)], 'ZData', [P_global(3), z_target]);
-
-    % 幾何学的な視野の重なり・凸包ポリゴンを計算して画面を更新
     update_camera_projections(P_global, global_rays, z_target, env, poly_fixed, handles);
     
+% 💡 【ここを追加】Pキーが押されたら、コマンドウィンドウに状況をプリントする！
+    if isfield(data, 'request_print') && data.request_print
+        fprintf('\n=== 📋 コピー用 デバッグ情報 ===\n');
+        fprintf('目標入力値 : r = %.4f, theta = %.4f, Z = %.4f\n', data.r, data.theta, data.current_z);
+        fprintf('計算された角度[rad]: [J1:%.4f, J2:%.4f, J3:%.4f, J4:%.4f]\n', ...
+            q_current(1).JointPosition, q_current(2).JointPosition, q_current(3).JointPosition, q_current(4).JointPosition);
+        fprintf('実際の手先位置[m]  : X = %.4f, Y = %.4f, Z = %.4f\n', P_global(1), P_global(2), P_global(3));
+        
+        % アーム根本からの実際の距離を計算
+        actual_r = sqrt(P_global(1)^2 + P_global(2)^2);
+        fprintf('実際の根本からの距離: %.4f\n', actual_r);
+        fprintf('================================\n');
+        
+        data.request_print = false; % 出力したらフラグを戻す
+        fig_main.UserData = data;
+    end
+
     drawnow;
+    pause(0.02); 
 end
 
 end % === メイン関数終了 ===
@@ -339,3 +375,80 @@ function clear_projections(handles)
     set(handles.poly_patch, 'XData', [], 'YData', [], 'ZData', []); 
 end
 
+%% 📦 関数: handle_keyboard_input (極座標ベース・デバッグ出力付き)
+function handle_keyboard_input(fig, event)
+    data = fig.UserData;
+    
+    switch lower(event.Key)
+        case 'w' 
+            data.r = data.r + 0.01;
+        case 's' 
+            data.r = data.r - 0.01;
+        case 'a' 
+            data.theta = data.theta + 0.05;
+        case 'd' 
+            data.theta = data.theta - 0.05;
+        case 'e' 
+            data.target_z = data.z_grasp;
+        case 'q' 
+            data.target_z = data.z_transit;
+        case 'p' % 💡 デバッグ情報出力キー
+            data.request_print = true;
+    end
+    
+    data.r = max(0.10, min(data.r, 0.35)); 
+    fig.UserData = data; 
+end
+
+%% 📦 関数: solve_geometric_ik (URDF完全解析・適合版)
+function q_angles = solve_geometric_ik(r, theta, z_tip)
+    % 📏 URDFから抽出した正確な骨の長さ
+    L1 = 0.0818; % 根本〜肩の高さ
+    L2 = 0.1160; % 肩〜肘 (0.11257と0.028の斜辺)
+    L3 = 0.1350; % 肘〜手首
+    L4 = 0.1300; % 手首〜指先 (※指先が机に埋まる場合はここを増やします)
+
+    % 1. 第1関節（ヨー角）: URDFの180度反転を相殺
+    q1 = theta + pi;
+
+    % 2. 手首の目標位置を逆算
+    r_w = r;
+    z_w = z_tip + L4;
+
+    % 3. 肩から手首までの直線距離 D
+    dz = z_w - L1;
+    D = sqrt(r_w^2 + dz^2);
+
+    % 安全リミッター
+    if D >= (L2 + L3 - 0.001)
+        D = L2 + L3 - 0.001; 
+        r_w = sqrt(D^2 - dz^2);
+    end
+
+    % 4. 幾何学的な基本角度の計算（数学上のピュアな角度）
+    % 肘の角度
+    cos_q3 = (D^2 - L2^2 - L3^2) / (2 * L2 * L3);
+    cos_q3 = max(-1, min(1, cos_q3)); 
+    q3_geo = -acos(cos_q3); % 肘を上に曲げる
+
+    % 肩の角度 (水平=0度)
+    alpha = atan2(dz, r_w);
+    beta = atan2(L3 * sin(abs(q3_geo)), L2 + L3 * cos(q3_geo));
+    q2_geo = alpha + beta;
+
+    % 手首の角度 (指先が真下を向く)
+    q4_geo = -pi/2 - (q2_geo + q3_geo);
+    
+    % =========================================================
+    % 🚨【最終補正】数学の角度を「SO-101のURDF」の角度に翻訳する
+    % =========================================================
+    % 解析の結果、このロボットは肩(J2)を -90度(-pi/2) すると真っ直ぐ前を向き、
+    % さらに骨がマイナス方向に伸びているため、肘(J3)と手首(J4)の曲がる方向が「逆」になります。
+    
+    q2_urdf = q2_geo - pi/2; 
+    q3_urdf = -q3_geo;       % 骨の向きが逆なので反転
+    q4_urdf = -q4_geo;       % 同様に反転
+
+    % 6つの角度を返す [ヨー, 肩, 肘, 手首, 手首ロール, カメラ]
+    q_angles = [q1, q2_urdf, q3_urdf, q4_urdf, 0, 0];
+end
