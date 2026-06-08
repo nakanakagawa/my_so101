@@ -111,6 +111,15 @@ while ishandle(fig_main)
     % URDFを見ると、shoulder_panはbase_linkから上に 0.0624m 浮いています。
     % ユーザー入力(data.z)は肩基準なので、base_link基準にするために 0.0624 を足します。
     target_pose = trvec2tform([data.x, data.y, data.z + 0.0624]);
+
+    % ==========================================================
+    % 🚑 【特異点・伸びきり対策】
+    % 肘(3番目の関節)が真っ直ぐ（0付近）になるとソルバーが曲げる方向を見失うので、
+    % 計算前に「マイナス（エルボーアップ）に曲げるんだよ」というヒントを強制注入する
+    if q_current(3).JointPosition > -0.05
+        q_current(3).JointPosition = -0.1; % わずかに上に曲げた状態を初期予測にする
+    end
+    % ==========================================================
     
     % 💡 2. Toolboxによる逆運動学 (IK) の実行！
     % q_current(今の姿勢)をヒントとして渡すことで、そこから最短で計算してくれます
@@ -199,6 +208,15 @@ function [robot, q_home, fig_main, poly_fixed, cam_dir, cam_up] = create_main_en
     % メインの3Dシミュレーション空間（机・マット・固定カメラ等）を生成する関数
     fig_main = figure('Name', 'SO-101 Task Environment', 'Color', 'w', 'Position', [50, 150, 750, 700]);
     robot = importrobot(urdfPath);
+
+    % ==========================================================
+    % 💡 【ズル休み防止】肩が真上や真下に逃げて、腕を伸ばしたまま距離を稼ぐのを禁止する
+    % （※ -1.2 〜 1.2 rad は約 ±68度。バンザイ姿勢を防ぎます）
+    robot.getBody('upper_arm_link').Joint.PositionLimits = [-1.2, 1.2]; 
+    
+    % 💡 【裏返り防止】先ほど設定した、肘が真っ直ぐの特異点でフリーズするのを防ぐ壁
+    robot.getBody('lower_arm_link').Joint.PositionLimits = [-1.55, 1.69];
+    % ==========================================================
     q_home = homeConfiguration(robot);
     show(robot, q_home, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
     hold on;
@@ -432,7 +450,7 @@ function handle_keyboard_input(fig, event)
     end
     
     % 大きく振りかぶりすぎないよう、大まかな限界値を設定
-    data.x = max(0.02, min(data.x, 0.30)); 
+    data.x = max(0.10, min(data.x, 0.30)); 
     % data.y = max(-0.25, min(data.y, 0.25)); % 💡 yの制限範囲も追加
     data.z = max(-0.20, min(data.z, 0.30)); 
     
