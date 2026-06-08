@@ -9,11 +9,23 @@ function so101_joint_calibrator()
     % UIフィギュアの作成
     fig = figure('Name', 'SO-101 Joint Limit Calibrator', 'Position', [100, 100, 1000, 600], 'Color', 'w');
     
-    % 3D描画エリア（左側）
+% 3D描画エリア（左側）
     ax = axes(fig, 'Position', [0.05, 0.1, 0.55, 0.8]);
     rotate3d(ax, 'on');
-    show(robot, q_home, 'Parent', ax, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
-    view(ax, [45, 30]); axis(ax, 'equal'); grid(ax, 'on');
+    
+    % 🚨 先にロボットを描画してしまいます（ここで一度 [-1,1] に広がります）
+    show(robot, q_home, 'Parent', ax, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'on');
+    
+    % 🚨 その「直後」に、人間様の指示で範囲を強制的に上書きして固定します！
+    axis(ax, 'equal'); 
+    xlim(ax, [0, 0.5]);
+    ylim(ax, [-0.4, 0.4]);
+    zlim(ax, [0, 0.5]); % 👈 これで Z のマイナスは絶対に表示されなくなります！
+    
+    % 🚨 最後に手動モードにしてガチガチにロック（これでもう二度と動きません）
+    axis(ax, 'manual'); 
+    grid(ax, 'on');
+    
     title(ax, '🤖 姿勢プレビュー', 'FontSize', 14);
     
     % 🚨【大修正】URDFから「動かせる関節」を自動で探し出す！
@@ -65,6 +77,14 @@ function so101_joint_calibrator()
         addlistener(sliders(i), 'ContinuousValueChange', @(src, event) updateRobot(src, i));
     end
     
+    % ==========================================
+    % 💡追加：座標軸(フレーム)のON/OFFチェックボックス
+    % ==========================================
+    chk_frames = uicontrol(pnl, 'Style', 'checkbox', 'String', '🌐 座標軸(フレーム)を表示', ...
+        'Units', 'normalized', 'Position', [0.05, 0.12, 0.9, 0.05], ...
+        'FontSize', 11, 'Value', 1, 'BackgroundColor', 'w', ...
+        'Callback', @(~,~) updateRobot(sliders(1), 1)); % チェックした瞬間に再描画
+
     % リセットボタン
     uicontrol(pnl, 'Style', 'pushbutton', 'String', '🔄 全て0度に戻す', ...
         'Units', 'normalized', 'Position', [0.05, 0.02, 0.9, 0.08], ...
@@ -88,7 +108,16 @@ function so101_joint_calibrator()
                 end
             end
         end
-        show(robot, q_current, 'Parent', ax, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
+        
+        % 💡 チェックボックスの状態を読み取って表示を切り替える
+        if chk_frames.Value == 1
+            frame_state = 'on';
+        else
+            frame_state = 'off';
+        end
+        
+        % 💡 'Frames' の設定を frame_state に変更
+        show(robot, q_current, 'Parent', ax, 'PreservePlot', false, 'FastUpdate', true, 'Frames', frame_state);
         drawnow;
     end
 

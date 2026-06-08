@@ -73,15 +73,13 @@ if exist('f_cams', 'var') && ishandle(f_cams)
     set(f_cams, 'WindowKeyPressFcn', @(src, event) handle_keyboard_input(fig_main, event));
 end
 
-% --- メインループに入る直前（75行目付近）に追加 ---
+% --- メインループに入る直前（75行目付近） ---
 q_current = q_home;
 z_target = env.desk_z_offset + env.mat_z_offset; 
 
-% 💡 3D空間に「目標位置」と「実際の手首位置」を表示するマーカーを作成
+% 💡 3Dマーカーの作成
 hold(fig_main.CurrentAxes, 'on');
-% 目標位置は「マゼンタ色の星マーク」
 h_target_marker = plot3(fig_main.CurrentAxes, NaN, NaN, NaN, 'p', 'MarkerSize', 15, 'MarkerFaceColor', 'm', 'MarkerEdgeColor', 'k');
-% 実際の位置は「シアン色の丸マーク」
 h_actual_marker = plot3(fig_main.CurrentAxes, NaN, NaN, NaN, 'o', 'MarkerSize', 10, 'MarkerFaceColor', 'c', 'MarkerEdgeColor', 'k');
 
 % ==========================================================
@@ -90,38 +88,55 @@ h_actual_marker = plot3(fig_main.CurrentAxes, NaN, NaN, NaN, 'o', 'MarkerSize', 
 h_line_x = plot3(fig_main.CurrentAxes, NaN, NaN, NaN, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1.2);
 h_line_z = plot3(fig_main.CurrentAxes, NaN, NaN, NaN, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1.2);
 
+% ==========================================================
+% 🤖 【Toolbox仕様】IKソルバーの準備（ループの外で1回だけ宣言！）
+% ==========================================================
+ik = inverseKinematics('RigidBodyTree', robot);
+ik.SolverParameters.AllowRandomRestart = false; % 追従をスムーズにするためオフ
+
+% 重み設定 [Rx, Ry, Rz, X, Y, Z] 
+% 姿勢(R)はどうでもいいので0、位置(XYZ)を絶対合わせたいので1にします
+weights = [0, 0, 0, 1, 1, 1]; 
+
+% ターゲットとする部位の名前（手首の曲げ関節の付け根）
+endEffector = 'wrist_link'; 
+% ==========================================================
+
+
 % --- リアルタイムループ ---
 while ishandle(fig_main)
     data = fig_main.UserData;
-        
-    % 💡 1 & 2. 余計な計算を消し、目標の x, y, z をそのままIK関数に投げる！
-    calculated_angles = solve_geometric_ik(data.x, data.y, data.z);
     
-    % 3. 実際に関節に送られる角度を取り出す
-    q1_real = calculated_angles(1); % shoulder_pan
-    q2_real = calculated_angles(2); % shoulder_lift
-    q3_real = calculated_angles(3); % elbow_flex
+    % 💡 1. 目標座標の設定 (Toolboxは一番下の base_link が原点)
+    % URDFを見ると、shoulder_panはbase_linkから上に 0.0624m 浮いています。
+    % ユーザー入力(data.z)は肩基準なので、base_link基準にするために 0.0624 を足します。
+    target_pose = trvec2tform([data.x, data.y, data.z + 0.0624]);
     
-    % 4. 順運動学（FK）を使って、実際の手首の位置を計算
-    l1 = 0.1160;
-    l2 = 0.1350;
+    % 💡 2. Toolboxによる逆運動学 (IK) の実行！
+    % q_current(今の姿勢)をヒントとして渡すことで、そこから最短で計算してくれます
+    [q_sol, solInfo] = ik(endEffector, target_pose, weights, q_current);
     
-    % まず、肩からの「直線距離」と「ロボットZ軸（下向き）の高さ」を算出
-    actual_local_dist = l1 * cos(q2_real) + l2 * cos(q2_real + q3_real);
-    actual_robot_z    = l1 * sin(q2_real) + l2 * sin(q2_real + q3_real);
+    % 手首の曲げ・回転などは今回は使わないので、0に固定
+    q_sol(4).JointPosition = 0;
+    q_sol(5).JointPosition = 0;
+    q_sol(6).JointPosition = 0;
     
-    % 旋回角(q1)を使って、3D空間上のワールド座標 (x, y, z) に戻す！
-    actual_x = actual_local_dist * cos(q1_real);
-    actual_y = actual_local_dist * sin(q1_real);
-    actual_z = -actual_robot_z; % ロボットの下向きZを、上向きZに反転して戻す
+    % ロボットに適用
+    q_current = q_sol;
     
-    % 5. UIテキストに「目標のxyz」と「実際の手首のxyz」を並べて表示
+    % 💡 3. Toolboxによる順運動学 (FK) で実際の手首位置を答え合わせ！
+    % もう面倒な cos や sin は不要。一発で4x4行列を取ってきます。
+    actual_tform = getTransform(robot, q_current, endEffector);
+    actual_x = actual_tform(1, 4);
+    actual_y = actual_tform(2, 4);
+    actual_z = actual_tform(3, 4) - 0.0624; % 表示用に肩基準(0.0624引く)に戻す
+    
+% 4. UIテキストとマーカーの更新
     txt_status.String = sprintf('🎯 目標 [x:%5.3f y:%5.3f z:%5.3f] | 🤖 実際 [x:%5.3f y:%5.3f z:%5.3f]', ...
                                 data.x, data.y, data.z, actual_x, actual_y, actual_z);
 
-    % 💡 3Dマーカーの座標をリアルタイム更新
-    set(h_target_marker, 'XData', data.x, 'YData', data.y, 'ZData', data.z);
-    set(h_actual_marker, 'XData', actual_x, 'YData', actual_y, 'ZData', actual_z);
+    set(h_target_marker, 'XData', data.x, 'YData', data.y, 'ZData', data.z + 0.0624); % マーカーもbase_link基準で配置
+    set(h_actual_marker, 'XData', actual_tform(1,4), 'YData', actual_tform(2,4), 'ZData', actual_tform(3,4));
 
     % ==========================================================
     % 💡 [追加] 補助点線が常にターゲット(★)を貫くように更新
@@ -132,16 +147,13 @@ while ishandle(fig_main)
     % Z軸に平行な線（距離 x が固定）
     set(h_line_z, 'XData', [data.x, data.x], 'YData', [data.y, data.y], 'ZData', [-0.05, 0.6]);
 
-    % ロボットに適用
-    for i = 1:6
-        q_current(i).JointPosition = calculated_angles(i);
-    end
-    
     % --- 以下、描画更新処理（変更なし） ---
     show(robot, q_current, 'Parent', fig_main.CurrentAxes, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
     
     T_link = getTransform(robot, q_current, cam_hand_info.attached_link);
     R_link = T_link(1:3, 1:3); P_link = T_link(1:3, 4);
+    
+    % ... (カメラ投影などの描画更新が続く) ...
     P_global = P_link + R_link * offset_local;
     R_global = R_link * R_cam_local;
     global_rays = R_global * local_rays;
