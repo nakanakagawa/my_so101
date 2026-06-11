@@ -2,6 +2,29 @@ function so101_3d_simulator()
 % SO-101 模倣学習環境 3Dシミュレータ (完全統合・関数カプセル化版)
 clc; close all;
 
+%% ==========================================================
+%% 0. ユーザー設定パラメータ (Control Parameters)
+%% ==========================================================
+ctrl_param = struct();
+
+% --- ワークスペース限界値 (Workspace Limits) [m] ---
+ctrl_param.ws_x_min = 0.02;  % 奥行き(X) 下限（ロボットへのめり込み防止）
+ctrl_param.ws_x_max = 0.45;  % 奥行き(X) 上限（最大リーチ）
+ctrl_param.ws_z_min = 0.06;  % 高さ(Z) 下限（机との干渉防止）
+ctrl_param.ws_z_max = 0.30;  % 高さ(Z) 上限
+
+% --- 初期目標座標 (Initial Target Position) [m] ---
+ctrl_param.init_x = 0.15;
+ctrl_param.init_y = 0.00;
+ctrl_param.init_z = 0.06;
+
+% --- 制御器の応答パラメータ (Controller Responses) ---
+ctrl_param.key_step = 0.02;          % キー入力1回あたりの目標変位量 [m]
+ctrl_param.xyz_speed_limit = 0.003;  % 手先位置のスルーレート（最大変化率）[m/step]
+ctrl_param.gripper_speed = 0.04;     % グリッパーのスルーレート [rad/step]
+ctrl_param.gripper_open_ang = 0.60;  % グリッパー開放時の角度 [rad]
+ctrl_param.gripper_close_ang = 0.00; % グリッパー閉鎖時の角度 [rad]
+
 % ロボットアームを動かせるやつ
 
 %% 1. 全体設定 ＆ 設定ファイルの読み込み
@@ -61,15 +84,23 @@ txt_status = uicontrol(pnl, 'Style', 'text', 'String', '初期化中...', ...
 
 disp('🎮 W/A/S/D/Q/E キーで手首の位置を直接操作します。');
 
-% 状態保存（肩関節を原点(0,0)とした X, Z 座標）
+% 状態保存（肩関節を原点(0,0)とした座標）
 data = struct();
-data.x = 0.15;       % 現実世界のX (前方に15cm)
-data.y = 0.0;        % 現実世界のY (左右ズレなし)
-data.z = 0.0;        % 現実世界のZ (基準の高さ)
+data.param = ctrl_param; % 💡 設定パラメータを格納して全体で共有
 
-% 💡 [追加] グリッパーの時系列制御用状態変数
-data.gripper_target = 0;    % 0: 完全閉鎖状態、1: 完全開放状態（目標値）
-data.gripper_current = 0.0; % 現在の関節角変位 [rad]
+% 最終目標位置（Target）
+data.target_x = ctrl_param.init_x;       
+data.target_y = ctrl_param.init_y;        
+data.target_z = ctrl_param.init_z;
+
+% 補間演算後の現在制御位置（Current）
+data.current_x = ctrl_param.init_x;      
+data.current_y = ctrl_param.init_y;       
+data.current_z = ctrl_param.init_z;      
+
+% グリッパー状態変数
+data.gripper_target = 0;    
+data.gripper_current = ctrl_param.gripper_close_ang; 
 fig_main.UserData = data;
 
 set(fig_main, 'WindowKeyPressFcn', @(src, event) handle_keyboard_input(fig_main, event));
@@ -132,80 +163,87 @@ aimCon.Weights = 0.001; % スケールを極小化し、位置誤差の最小化
 % --- リアルタイムループ ---
 while ishandle(fig_main)
     data = fig_main.UserData;
-    
-    % 💡 1. 目標座標の設定
-    target_z_world = data.z + 0.0624;
-    
-    % お願い1のアップデート：指定した x, y, z に行って！
-    posCon.TargetPosition = [data.x, data.y, target_z_world];
-    
-    % お願い2のアップデート：現在地の「はるか真下」を見つめて！
-    % (Z座標を 10.0 にすることで、常に鉛直下向きに引っ張られる)
-    aimCon.TargetPoint = [data.x, data.y, 10.0];
-    
-    % 💡 2. Toolbox(GIK)による逆運動学の実行！
-    [q_sol, solInfo] = gik(q_current, posCon, aimCon);
-    
-    % 手首の回転(wrist_roll)などは今回は0固定
-    q_sol(5).JointPosition = 0;
-    q_sol(6).JointPosition = 0;
-    
-    % ロボットに適用
-    q_current = q_sol;
-
+        
     % ==========================================================
-    % 💡 [追加] 離散時間線形補間によるグリッパーの平滑化制御
+    % 💡 [追加] 各軸独立スルーレートリミッター（線形補間）
     % ==========================================================
-    % 目標関節角の設定（開放時: 0.40 rad, 閉鎖時: 0.00 rad）
-    % ※実機のURDFのJoint Limitsに合わせて適宜上限値を調整してください
-    if data.gripper_target == 1
-        target_angle = 0.60; 
-    else
-        target_angle = 0.00;
+    % 1サンプリング周期（0.02秒）あたりの最大移動量 [m]
+    % 0.003 m/step = 秒速約 15 cm の滑らかな等速運動
+    xyz_speed_limit = data.param.xyz_speed_limit; % 💡 パラメータから取得    
+    % X軸の補間
+    if data.current_x < data.target_x
+        data.current_x = min(data.target_x, data.current_x + xyz_speed_limit);
+    elseif data.current_x > data.target_x
+        data.current_x = max(data.target_x, data.current_x - xyz_speed_limit);
     end
     
-    % 1サンプリング周期（0.02秒）あたりの最大変位量（角速度制限）
-    % この値を大きくすると高速に、小さくするとより滑らかに動きます
-    delta_limit = 0.04; 
+    % Y軸の補間
+    if data.current_y < data.target_y
+        data.current_y = min(data.target_y, data.current_y + xyz_speed_limit);
+    elseif data.current_y > data.target_y
+        data.current_y = max(data.target_y, data.current_y - xyz_speed_limit);
+    end
     
-    % 目標値への追従演算（飽和要素付き線形補間）
+    % Z軸の補間
+    if data.current_z < data.target_z
+        data.current_z = min(data.target_z, data.current_z + xyz_speed_limit);
+    elseif data.current_z > data.target_z
+        data.current_z = max(data.target_z, data.current_z - xyz_speed_limit);
+    end
+    
+    % 内部状態をUserDataに保存
+    fig_main.UserData.current_x = data.current_x;
+    fig_main.UserData.current_y = data.current_y;
+    fig_main.UserData.current_z = data.current_z;
+    
+    % ==========================================================
+    % ⚙️ GIK（一般化逆運動学）の実行
+    % ==========================================================
+    % 補間された現在の制御座標（current）をベースリンク基準（+0.0624）にしてソルバーに渡す
+    target_z_world = data.current_z + 0.0624;
+    posCon.TargetPosition = [data.current_x, data.current_y, target_z_world];
+    aimCon.TargetPoint = [data.current_x, data.current_y, 10.0]; % 鉛直下向き照準
+    
+    [q_sol, solInfo] = gik(q_current, posCon, aimCon);
+    
+    q_sol(5).JointPosition = 0;
+    q_sol(6).JointPosition = 0;
+    q_current = q_sol;
+
+ % グリッパーの線形補間制御
+    if data.gripper_target == 1
+        target_angle = data.param.gripper_open_ang; % 💡 パラメータから取得
+    else
+        target_angle = data.param.gripper_close_ang; % 💡 パラメータから取得
+    end
+    delta_limit = data.param.gripper_speed; % 💡 パラメータから取得
+
     if data.gripper_current < target_angle
         data.gripper_current = min(target_angle, data.gripper_current + delta_limit);
     elseif data.gripper_current > target_angle
         data.gripper_current = max(target_angle, data.gripper_current - delta_limit);
     end
-    
-    % 更新された状態変数をUserDataにライトバック
     fig_main.UserData.gripper_current = data.gripper_current;
-    
-    % 抽出されたグリッパー関節群へ計算された変位を一斉に適用
     for idx = gripper_joint_indices
         q_current(idx).JointPosition = data.gripper_current;
     end
-    % ==========================================================
-    
-    % 💡 3. Toolboxによる順運動学 (FK) で実際の手首位置を答え合わせ！
-    % もう面倒な cos や sin は不要。一発で4x4行列を取ってきます。
+
+    % 順運動学（FK）による実際の手先位置の算定
     actual_tform = getTransform(robot, q_current, endEffector);
     actual_x = actual_tform(1, 4);
     actual_y = actual_tform(2, 4);
-    actual_z = actual_tform(3, 4) - 0.0624; % 表示用に肩基準(0.0624引く)に戻す
+    actual_z = actual_tform(3, 4) - 0.0624; 
     
-% 4. UIテキストとマーカーの更新
+    % UIテキストとマーカーの更新（★マークは最終目的地に配置）
     txt_status.String = sprintf('🎯 目標 [x:%5.3f y:%5.3f z:%5.3f] | 🤖 実際 [x:%5.3f y:%5.3f z:%5.3f]', ...
-                                data.x, data.y, data.z, actual_x, actual_y, actual_z);
+                                data.target_x, data.target_y, data.target_z, actual_x, actual_y, actual_z);
 
-    set(h_target_marker, 'XData', data.x, 'YData', data.y, 'ZData', data.z + 0.0624); % マーカーもbase_link基準で配置
+    set(h_target_marker, 'XData', data.target_x, 'YData', data.target_y, 'ZData', data.target_z + 0.0624); 
     set(h_actual_marker, 'XData', actual_tform(1,4), 'YData', actual_tform(2,4), 'ZData', actual_tform(3,4));
 
-    % ==========================================================
-    % 💡 [追加] 補助点線が常にターゲット(★)を貫くように更新
-    % 描画範囲 (plot_xlim, plot_zlim) の端から端まで線を引きます
-    % ==========================================================
-    % X軸に平行な線（高さ z が固定）
-    set(h_line_x, 'XData', [-0.1, 0.8], 'YData', [data.y, data.y], 'ZData', [data.z + 0.0624, data.z + 0.0624]);
-    % Z軸に平行な線（距離 x が固定）
-    set(h_line_z, 'XData', [data.x, data.x], 'YData', [data.y, data.y], 'ZData', [-0.05, 0.6]);
+    % 補助点線の更新
+    set(h_line_x, 'XData', [-0.1, 0.8], 'YData', [data.target_y, data.target_y], 'ZData', [data.target_z + 0.0624, data.target_z + 0.0624]);
+    set(h_line_z, 'XData', [data.target_x, data.target_x], 'YData', [data.target_y, data.target_y], 'ZData', [-0.05, 0.6]);
 
     % --- 以下、描画更新処理（変更なし） ---
     show(robot, q_current, 'Parent', fig_main.CurrentAxes, 'PreservePlot', false, 'FastUpdate', true, 'Frames', 'off');
@@ -480,25 +518,26 @@ function clear_projections(handles)
     set(handles.poly_patch, 'XData', [], 'YData', [], 'ZData', []); 
 end
 
+
 %% 📦 関数: handle_keyboard_input (X, Z 直接操作版)
 function handle_keyboard_input(fig, event)
     data = fig.UserData;
-    step = 0.01;
+    p = data.param; % 💡 記述を短くするために設定を変数 p に受ける
     
     switch lower(event.Key)
         case 'w' % 前進 (+x)
-            data.x = data.x + step;
+            data.target_x = data.target_x + p.key_step;
         case 's' % 後退 (-x)
-            data.x = data.x - step;
+            data.target_x = data.target_x - p.key_step;
         case 'a' % 左移動 (+y)
-            data.y = data.y + step;
+            data.target_y = data.target_y + p.key_step;
         case 'd' % 右移動 (-y)
-            data.y = data.y - step;
+            data.target_y = data.target_y - p.key_step;
         case 'q' % 上昇 (+z)
-            data.z = data.z + step;
+            data.target_z = data.target_z + p.key_step;
         case 'e' % 降下 (-z)
-            data.z = data.z - step;
-        case 'g' % 💡 [追加] グリッパー状態のトグル制御
+            data.target_z = data.target_z - p.key_step;
+        case 'g' % グリッパー状態のトグル制御
             if data.gripper_target == 0
                 data.gripper_target = 1;
                 disp('🔓 Gripper: 開放運動を開始');
@@ -508,9 +547,9 @@ function handle_keyboard_input(fig, event)
             end
     end
     
-    % 大きく振りかぶりすぎないよう、大まかな限界値を設定
-    data.x = max(0.02, min(data.x, 0.30)); 
-    data.z = max(-0.20, min(data.z, 0.30)); 
+    % ワークスペースの飽和処理（設定パラメータを使用して制限）
+    data.target_x = max(p.ws_x_min, min(data.target_x, p.ws_x_max)); 
+    data.target_z = max(p.ws_z_min, min(data.target_z, p.ws_z_max)); 
     
     fig.UserData = data; 
 end
