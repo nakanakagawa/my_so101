@@ -89,44 +89,45 @@ h_line_x = plot3(fig_main.CurrentAxes, NaN, NaN, NaN, '--', 'Color', [0.5 0.5 0.
 h_line_z = plot3(fig_main.CurrentAxes, NaN, NaN, NaN, '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1.2);
 
 % ==========================================================
-% 🤖 【Toolbox仕様】IKソルバーの準備（ループの外で1回だけ宣言！）
+% 【Toolbox仕様】GIK（一般化逆運動学）ソルバーの準備
 % ==========================================================
-ik = inverseKinematics('RigidBodyTree', robot);
-ik.SolverParameters.AllowRandomRestart = false; % 追従をスムーズにするためオフ
+endEffector = 'gripper_link'; 
 
-% 重み設定 [Rx, Ry, Rz, X, Y, Z] 
-% 姿勢(R)はどうでもいいので0、位置(XYZ)を絶対合わせたいので1にします
-weights = [0, 0, 0, 1, 1, 1]; 
+gik = generalizedInverseKinematics('RigidBodyTree', robot, ...
+    'ConstraintInputs', {'position', 'aiming'});
 
-% ターゲットとする部位の名前（手首の曲げ関節の付け根）
-endEffector = 'wrist_link'; 
-% ==========================================================
+% 時間的連続性を担保するため、ランダムリスタートは必ず無効化（false）する
+gik.SolverParameters.AllowRandomRestart = false;
+gik.SolverParameters.MaxIterations = 150;
+
+% ① 位置の制約（絶対優先タスク）
+posCon = constraintPositionTarget(endEffector);
+posCon.Weights = 100.0; % スケールを大きく引き上げ、位置誤差に対するペナルティを極大化する
+
+% ② 照準の制約（劣後タスク）
+aimCon = constraintAiming(endEffector);
+aimCon.AngularTolerance = deg2rad(1);
+aimCon.Weights = 0.001; % スケールを極小化し、位置誤差の最小化を妨げない範囲でのみ姿勢を誘導する
 
 
 % --- リアルタイムループ ---
 while ishandle(fig_main)
     data = fig_main.UserData;
     
-    % 💡 1. 目標座標の設定 (Toolboxは一番下の base_link が原点)
-    % URDFを見ると、shoulder_panはbase_linkから上に 0.0624m 浮いています。
-    % ユーザー入力(data.z)は肩基準なので、base_link基準にするために 0.0624 を足します。
-    target_pose = trvec2tform([data.x, data.y, data.z + 0.0624]);
-
-    % ==========================================================
-    % 🚑 【特異点・伸びきり対策】
-    % 肘(3番目の関節)が真っ直ぐ（0付近）になるとソルバーが曲げる方向を見失うので、
-    % 計算前に「マイナス（エルボーアップ）に曲げるんだよ」というヒントを強制注入する
-    if q_current(3).JointPosition > -0.05
-        q_current(3).JointPosition = -0.1; % わずかに上に曲げた状態を初期予測にする
-    end
-    % ==========================================================
+    % 💡 1. 目標座標の設定
+    target_z_world = data.z + 0.0624;
     
-    % 💡 2. Toolboxによる逆運動学 (IK) の実行！
-    % q_current(今の姿勢)をヒントとして渡すことで、そこから最短で計算してくれます
-    [q_sol, solInfo] = ik(endEffector, target_pose, weights, q_current);
+    % お願い1のアップデート：指定した x, y, z に行って！
+    posCon.TargetPosition = [data.x, data.y, target_z_world];
     
-    % 手首の曲げ・回転などは今回は使わないので、0に固定
-    q_sol(4).JointPosition = 0;
+    % お願い2のアップデート：現在地の「はるか真下」を見つめて！
+    % (Z座標を 10.0 にすることで、常に鉛直下向きに引っ張られる)
+    aimCon.TargetPoint = [data.x, data.y, 10.0];
+    
+    % 💡 2. Toolbox(GIK)による逆運動学の実行！
+    [q_sol, solInfo] = gik(q_current, posCon, aimCon);
+    
+    % 手首の回転(wrist_roll)などは今回は0固定
     q_sol(5).JointPosition = 0;
     q_sol(6).JointPosition = 0;
     
