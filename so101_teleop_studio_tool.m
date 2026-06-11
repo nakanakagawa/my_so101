@@ -66,6 +66,10 @@ data = struct();
 data.x = 0.15;       % 現実世界のX (前方に15cm)
 data.y = 0.0;        % 現実世界のY (左右ズレなし)
 data.z = 0.0;        % 現実世界のZ (基準の高さ)
+
+% 💡 [追加] グリッパーの時系列制御用状態変数
+data.gripper_target = 0;    % 0: 完全閉鎖状態、1: 完全開放状態（目標値）
+data.gripper_current = 0.0; % 現在の関節角変位 [rad]
 fig_main.UserData = data;
 
 set(fig_main, 'WindowKeyPressFcn', @(src, event) handle_keyboard_input(fig_main, event));
@@ -76,6 +80,21 @@ end
 % --- メインループに入る直前（75行目付近） ---
 q_current = q_home;
 z_target = env.desk_z_offset + env.mat_z_offset; 
+
+% 💡 [追加] URDFモデルからグリッパー関節のインデックスを自動抽出
+gripper_joint_indices = [];
+for i = 1:numel(q_current)
+    joint_name = q_current(i).JointName;
+    % 関節名に 'finger' または 'gripper' を含むものを検出
+    if contains(lower(joint_name), 'finger') || contains(lower(joint_name), 'gripper')
+        gripper_joint_indices = [gripper_joint_indices, i];
+    end
+end
+
+% 文字列マッチングで検出できない場合のフォールバック（第7関節以降をグリッパーと仮定）
+if isempty(gripper_joint_indices) && numel(q_current) > 6
+    gripper_joint_indices = 7:numel(q_current);
+end
 
 % 💡 3Dマーカーの作成
 hold(fig_main.CurrentAxes, 'on');
@@ -133,6 +152,37 @@ while ishandle(fig_main)
     
     % ロボットに適用
     q_current = q_sol;
+
+    % ==========================================================
+    % 💡 [追加] 離散時間線形補間によるグリッパーの平滑化制御
+    % ==========================================================
+    % 目標関節角の設定（開放時: 0.40 rad, 閉鎖時: 0.00 rad）
+    % ※実機のURDFのJoint Limitsに合わせて適宜上限値を調整してください
+    if data.gripper_target == 1
+        target_angle = 0.60; 
+    else
+        target_angle = 0.00;
+    end
+    
+    % 1サンプリング周期（0.02秒）あたりの最大変位量（角速度制限）
+    % この値を大きくすると高速に、小さくするとより滑らかに動きます
+    delta_limit = 0.04; 
+    
+    % 目標値への追従演算（飽和要素付き線形補間）
+    if data.gripper_current < target_angle
+        data.gripper_current = min(target_angle, data.gripper_current + delta_limit);
+    elseif data.gripper_current > target_angle
+        data.gripper_current = max(target_angle, data.gripper_current - delta_limit);
+    end
+    
+    % 更新された状態変数をUserDataにライトバック
+    fig_main.UserData.gripper_current = data.gripper_current;
+    
+    % 抽出されたグリッパー関節群へ計算された変位を一斉に適用
+    for idx = gripper_joint_indices
+        q_current(idx).JointPosition = data.gripper_current;
+    end
+    % ==========================================================
     
     % 💡 3. Toolboxによる順運動学 (FK) で実際の手首位置を答え合わせ！
     % もう面倒な cos や sin は不要。一発で4x4行列を取ってきます。
@@ -440,19 +490,26 @@ function handle_keyboard_input(fig, event)
             data.x = data.x + step;
         case 's' % 後退 (-x)
             data.x = data.x - step;
-        case 'a' % 💡左移動 (+y) に修正
+        case 'a' % 左移動 (+y)
             data.y = data.y + step;
-        case 'd' % 💡右移動 (-y) に修正
+        case 'd' % 右移動 (-y)
             data.y = data.y - step;
         case 'q' % 上昇 (+z)
             data.z = data.z + step;
         case 'e' % 降下 (-z)
             data.z = data.z - step;
+        case 'g' % 💡 [追加] グリッパー状態のトグル制御
+            if data.gripper_target == 0
+                data.gripper_target = 1;
+                disp('🔓 Gripper: 開放運動を開始');
+            else
+                data.gripper_target = 0;
+                disp('🔒 Gripper: 閉鎖運動を開始');
+            end
     end
     
     % 大きく振りかぶりすぎないよう、大まかな限界値を設定
-    data.x = max(0.10, min(data.x, 0.30)); 
-    % data.y = max(-0.25, min(data.y, 0.25)); % 💡 yの制限範囲も追加
+    data.x = max(0.02, min(data.x, 0.30)); 
     data.z = max(-0.20, min(data.z, 0.30)); 
     
     fig.UserData = data; 
