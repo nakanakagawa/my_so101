@@ -1,3 +1,4 @@
+% 関節角度指定による姿勢の変化
 function so101_joint_calibrator()
     % URDFのパス
     urdfPath = '/home/hogehoge/Genesis/examples/robots/so101/so101_new.urdf';

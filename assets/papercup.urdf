@@ -1,0 +1,59 @@
+<?xml version="1.0"?>
+<robot name="paper_cup">
+  <link name="base_link">
+    <!-- 慣性プロパティ (50g) -->
+    <inertial>
+      <origin xyz="0 0 0.015" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="0.000018" ixy="0.0" ixz="0.0" iyy="0.000018" iyz="0.0" izz="0.000029"/>
+    </inertial>
+    
+    <!-- 視覚メッシュ (実機の形状) -->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <!-- URDFとSTLが同階層にあるためファイル名のみ指定 -->
+        <mesh filename="papercup.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="white">
+        <color rgba="0.9 0.9 0.9 1"/>
+      </material>
+    </visual>
+    
+    <!-- 衝突メッシュ1: 底面 -->
+    <collision>
+      <origin xyz="0 0 0.001" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.059 0.059 0.002"/>
+      </geometry>
+    </collision>
+    <!-- 衝突メッシュ2: +X壁 -->
+    <collision>
+      <origin xyz="0.0285 0 0.015" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.002 0.059 0.030"/>
+      </geometry>
+    </collision>
+    <!-- 衝突メッシュ3: -X壁 -->
+    <collision>
+      <origin xyz="-0.0285 0 0.015" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.002 0.059 0.030"/>
+      </geometry>
+    </collision>
+    <!-- 衝突メッシュ4: +Y壁 -->
+    <collision>
+      <origin xyz="0 0.0285 0.015" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.055 0.002 0.030"/>
+      </geometry>
+    </collision>
+    <!-- 衝突メッシュ5: -Y壁 -->
+    <collision>
+      <origin xyz="0 -0.0285 0.015" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.055 0.002 0.030"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>
