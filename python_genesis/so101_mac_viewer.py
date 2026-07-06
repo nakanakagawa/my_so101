@@ -16,6 +16,7 @@
 # ============================================================
 import genesis as gs
 import numpy as np
+import json
 import torch
 import torch.nn as nn
 import os
@@ -31,12 +32,13 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import gymnasium as gym
 from gymnasium import spaces
 
+
 # ============================================================
 # STEP 2: SO-101 URDFをダウンロード（初回のみ）
 # ============================================================
-URDF_DIR  = os.path.join(os.path.dirname(__file__), "so101_urdf")
-URDF_PATH = os.path.join(URDF_DIR, "so101.urdf")
-
+# URDF_DIR  = os.path.join(os.path.dirname(__file__), "so101_urdf")
+# URDF_PATH = os.path.join(URDF_DIR, '/home/hogehoge/Genesis/examples/robots/so101/so101_new.urdf')
+URDF_PATH = '/home/hogehoge/Genesis/examples/robots/so101/so101_new.urdf'
 def download_so101():
     os.makedirs(URDF_DIR, exist_ok=True)
     os.makedirs(os.path.join(URDF_DIR, "assets"), exist_ok=True)
@@ -61,7 +63,8 @@ def download_so101():
                 print(f"  ✗ {stl}: {e}")
 
 if not os.path.exists(URDF_PATH):
-    download_so101()
+    # download_so101()
+    pass
 else:
     print("✓ URDFはすでに存在します")
 
@@ -411,7 +414,14 @@ def train():
     return model, SAVE_DIR
 
 
-
+def is_valid_spawn_area(x, y):
+    """座標(x, y)が出現条件を満たしているか判定する関数"""
+    # 条件: 黒マット・カメラ視野・リーチの共通領域（暫定の大枠範囲）
+    if not (0.05 <= x <= 0.18 and -0.25 <= y <= -0.02):
+        return False
+        
+    # ※ 後ほどここに「アームの陰になるエリアを除外する条件」を追加します
+    return True
 
 # ============================================================
 # STEP 7: キーボードテレオペモード（環境確認用）
@@ -433,6 +443,7 @@ def train():
 
 def run_keyboard_teleop():
     from genesis.vis.keybindings import Key, KeyAction, Keybind
+    from matplotlib.path import Path  # 視野ポリゴンの判定に使用
 
     try:
         gs.init(backend=gs.cpu, logging_level="info")
@@ -479,56 +490,37 @@ def run_keyboard_teleop():
             morph=gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml")
         )
 
-    colors = [
-        (1.0, 0.3, 0.3), (0.3, 1.0, 0.3), (0.3, 0.3, 1.0),
-        (1.0, 1.0, 0.3), (1.0, 0.5, 0.0),
-    ]
-    cube_positions = [
-        (0.12, -0.08, 0.0125), (0.12,  0.08, 0.0125),
-        (0.16,  0.00, 0.0125), (0.18, -0.08, 0.0125),
-        (0.18,  0.08, 0.0125),
-    ]
-    cubes = [
-        scene.add_entity(
-            material=gs.materials.Rigid(
-                rho=2000,              # 密度を上げて重くする（アルミ程度）
-                friction=2.0,          # 剛体ソルバー内の摩擦（滑りにくく）
-                coup_friction=5.0,     # グリッパーとの接触摩擦
-                coup_restitution=0.3,  # 弾力（0=非弾性, 1=完全弾性）
-            ),
-            morph=gs.morphs.Box(size=(0.025, 0.025, 0.025), pos=p, fixed=False),
-            surface=gs.surfaces.Default(color=(*c, 1.0)),
-        )
-        for p, c in zip(cube_positions, colors)
-    ]
+    # ──────────────────────────────────────────
+    # 🧽 スポンジ（1個）の初期化
+    # ──────────────────────────────────────────
+    # スポンジ用の高摩擦マテリアル
+    sponge_material = gs.materials.Rigid(
+        rho=500, friction=2.0, coup_friction=5.0, coup_restitution=0.1
+    )
+    sponge = scene.add_entity(
+        material=sponge_material,
+        morph=gs.morphs.Box(size=(0.025, 0.025, 0.025), pos=(0.12, 0.08, 0.0125), fixed=False),
+        surface=gs.surfaces.Default(color=(1.0, 0.5, 0.0, 1.0)), # 見分けやすいようにオレンジ色に設定
+    )
 
     # ──────────────────────────────────────────
-    # 🗑️ 紙コップ（視覚＋衝突メッシュの動的剛体）の表示
+    # 🗑️ 紙コップ（1個）の初期化
     # ──────────────────────────────────────────
     import os
-
-    # スクリプトがあるフォルダ (python_genesis) の一つ上 (my_so101) の assets フォルダ
     script_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(script_dir)
     cup_urdf_path = os.path.join(parent_dir, "assets", "papercup.urdf")
 
-    cup_x, cup_y = 0.15, -0.15  # コップの初期配置XY座標
-
-    # 紙コップ用の高摩擦マテリアル定義
     cup_material = gs.materials.Rigid(
-        rho=500,           # 50gという目標値に近づけるための密度設定
-        friction=2.0,      # 床との摩擦
-        coup_friction=3.0, # 把持力を高めるために強めに設定
-        coup_restitution=0.1
+        rho=500, friction=2.0, coup_friction=3.0, coup_restitution=0.1
     )
-
-    scene.add_entity(
+    cup = scene.add_entity(
+        material=cup_material,
         morph=gs.morphs.URDF(
             file=cup_urdf_path,
-            pos=(cup_x, cup_y, 0.0),
+            pos=(0.15, -0.15, 0.0),
             fixed=False
-        ),
-        material=cup_material  # マテリアルを適用
+        )
     )
 
     # ──────────────────────────────────────────
@@ -551,6 +543,131 @@ def run_keyboard_teleop():
         lookat=(0.15, 0.0, 0.0),
         fov=60,
     )
+
+# ──────────────────────────────────────────
+    # 📂 config JSONの読み込み と 幾何学計算
+    # ──────────────────────────────────────────
+    config_path = os.path.join(parent_dir, "config", "env_config.json")
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            env_config = json.load(f)
+    except FileNotFoundError:
+        print(f"⚠️ {config_path} が見つかりません。デフォルト値を使用します。")
+        env_config = {
+            "environment": {"mat_x_start": 0.13, "mat_y_start": -0.405, "mat_length": 0.30, "mat_width": 0.69, "mat_z_offset": 0.001, "desk_z_offset": -0.0054},
+            "cameras": {"cam_fixed_side": {"x": 0.025, "y": -0.12, "z": 0.4546, "pitch_deg": -56.2, "fov_h_deg": 54.7, "fov_v_deg": 42.1}}
+        }
+
+    env_data = env_config["environment"]
+    cam_data = env_config["cameras"]["cam_fixed_side"]
+
+    mat_x_start = env_data["mat_x_start"]
+    mat_y_start = env_data["mat_y_start"]
+    mat_length  = env_data["mat_length"]
+    mat_width   = env_data["mat_width"]
+    mat_z       = env_data.get("desk_z_offset", -0.0054) + env_data.get("mat_z_offset", 0.001)
+
+    # --- アームの把持可能範囲（極座標パラメータ） ---
+    arm_reach_min = env_data.get("arm_reach_min", 0.10)
+    arm_reach_max = env_data.get("arm_reach_max", 0.30)
+    arm_yaw_min   = np.deg2rad(env_data.get("arm_yaw_min_deg", -90.0))
+    arm_yaw_max   = np.deg2rad(env_data.get("arm_yaw_max_deg", 90.0))
+
+    # --- shoulder_panのワールド座標を計算 ---
+    # Genesisでのロボット配置座標 + URDFから読み取ったオフセット
+    robot_x, robot_y = 0.04, 0.04
+    shoulder_offset_x = 0.0388
+    shoulder_offset_y = 0.0
+    
+    shoulder_x = robot_x + shoulder_offset_x
+    shoulder_y = robot_y + shoulder_offset_y
+
+
+    cam_x, cam_y, cam_z = cam_data["x"], cam_data["y"], cam_data["z"]
+
+    # --- 固定カメラの視野（FOV）ポリゴン計算 ---
+    pitch = np.deg2rad(cam_data["pitch_deg"])
+    cam_dir   = np.array([np.cos(pitch), 0, np.sin(pitch)])
+    cam_right = np.array([0, -1, 0])
+    cam_up    = np.array([-np.sin(pitch), 0, np.cos(pitch)])
+
+    w = np.tan(np.deg2rad(cam_data["fov_h_deg"]) / 2)
+    h = np.tan(np.deg2rad(cam_data["fov_v_deg"]) / 2)
+
+    rays = np.array([
+        cam_dir + w * cam_right + h * cam_up,
+        cam_dir - w * cam_right + h * cam_up,
+        cam_dir - w * cam_right - h * cam_up,
+        cam_dir + w * cam_right - h * cam_up
+    ])
+
+    # Z = mat_z 平面との交点を計算
+    t = (mat_z - cam_z) / rays[:, 2]
+    cam_pos = np.array([cam_x, cam_y, cam_z])
+    intersect_pts = cam_pos + t[:, np.newaxis] * rays
+    fov_poly = Path(intersect_pts[:, :2]) # ポリゴン生成
+
+    # --- アームの把持可能範囲（ユーザー設定） ---
+    ws_x_min = 0.02
+    ws_x_max = 0.45
+    # ws_y_min, ws_y_max の制限も追加する場合はここに
+
+    # ──────────────────────────────────────────
+    # 📍 エリア判定関数（マット寸法 ＋ カメラ視野 ＋ 極座標アーム範囲）
+    # ──────────────────────────────────────────
+    def is_valid_spawn_area(x, y):
+        # 条件1: 完全に黒マットの内側であること
+        if not (mat_x_start <= x <= (mat_x_start + mat_length)): return False
+        if not (mat_y_start <= y <= (mat_y_start + mat_width)):  return False
+
+        # 条件2: カメラの視野ポリゴンの内側であること
+        if not fov_poly.contains_point((x, y)): return False
+
+        # 条件3: アームの把持可能範囲（shoulder_pan基準の極座標）
+        dx = x - shoulder_x
+        dy = y - shoulder_y
+        r = np.sqrt(dx**2 + dy**2)
+        theta = np.arctan2(dy, dx)
+
+        if not (arm_reach_min <= r <= arm_reach_max): 
+            return False
+        if not (arm_yaw_min <= theta <= arm_yaw_max): 
+            return False
+            
+        return True
+
+    # ──────────────────────────────────────────
+    # ⬛ 黒マットの表示（JSONから自動計算）
+    # ──────────────────────────────────────────
+    mat_center_x = mat_x_start + (mat_length / 2.0)
+    mat_center_y = mat_y_start + (mat_width / 2.0)
+    
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(mat_length, mat_width, 0.002),       
+            pos=(mat_center_x, mat_center_y, 0.001),
+            fixed=True
+        ),
+        surface=gs.surfaces.Default(color=(0.15, 0.15, 0.15, 1.0))
+    )
+
+# ──────────────────────────────────────────
+    # 🟩 【デバッグ用】出現エリアの可視化（ホログラム仕様）
+    # ──────────────────────────────────────────
+    print("有効エリアのマーカーを生成中...")
+    for x in np.arange(mat_x_start, mat_x_start + mat_length + 0.03, 0.03):
+        for y in np.arange(mat_y_start, mat_y_start + mat_width + 0.03, 0.03):
+            if is_valid_spawn_area(x, y):
+                scene.add_entity(
+                    morph=gs.morphs.Box(
+                        size=(0.008, 0.008, 0.001), 
+                        pos=(x, y, 0.0025), 
+                        fixed=True,
+                        collision=False  # 物理演算から除外
+                    ),
+                    surface=gs.surfaces.Default(color=(0.0, 1.0, 0.0, 0.7))
+                )
 
     scene.build()
     n_dofs = robot.n_dofs
@@ -620,16 +737,45 @@ def run_keyboard_teleop():
         torque = KP * (target_qpos - current_pos) - KD * current_vel
         robot.control_dofs_force(torque)
 
+
+
     def reset_scene():
         target_qpos[:] = 0.0
         robot.set_dofs_position(target_qpos)
         rng = np.random.default_rng()
-        for cube in cubes:
-            cx = rng.uniform(0.05, 0.18)
-            cy = rng.uniform(-0.25, -0.02)
-            cube.set_pos(np.array([cx, cy, 0.0125], dtype=np.float32))
-            cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
-        print("↺ リセット完了")
+        
+        MIN_DIST = 0.06
+
+        # ★ 探索範囲をマットの寸法から動的に取得
+        # X: mat_x_start 〜 (mat_x_start + mat_length)
+        # Y: mat_y_start 〜 (mat_y_start + mat_width)
+        x_min, x_max = mat_x_start, mat_x_start + mat_length
+        y_min, y_max = mat_y_start, mat_y_start + mat_width
+
+        # 1. 紙コップの配置座標を決定
+        while True:
+            cup_x = rng.uniform(x_min, x_max)
+            cup_y = rng.uniform(y_min, y_max)
+            if is_valid_spawn_area(cup_x, cup_y):
+                break
+        
+        cup.set_pos(np.array([cup_x, cup_y, 0.015], dtype=np.float32))
+        cup.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+
+        # 2. スポンジの配置座標を決定
+        while True:
+            sp_x = rng.uniform(x_min, x_max)
+            sp_y = rng.uniform(y_min, y_max)
+            if not is_valid_spawn_area(sp_x, sp_y):
+                continue
+            dist = np.sqrt((sp_x - cup_x)**2 + (sp_y - cup_y)**2)
+            if dist >= MIN_DIST:
+                break
+                
+        sponge.set_pos(np.array([sp_x, sp_y, 0.0125], dtype=np.float32))
+        sponge.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+        
+        print(f"↺ リセット完了 (生成範囲 X:{x_min:.2f}-{x_max:.2f}, Y:{y_min:.2f}-{y_max:.2f})")
 
     is_running = True
     def stop():
