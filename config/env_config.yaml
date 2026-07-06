@@ -1,0 +1,55 @@
+# 環境設定ファイル (YAML版)
+
+environment:
+  # デスク全体の範囲 [m]
+  desk_x_min: -0.025
+  desk_x_max: 0.725
+  desk_y_min: -1.400
+  desk_y_max: 0.360
+  desk_z_offset: -0.0054
+
+  # 黒マットの設定 [m]
+  mat_x_start: 0.13
+  mat_y_start: -0.405
+  mat_length: 0.30
+  mat_width: 0.69
+  mat_z_offset: 0.001
+
+  # アーム把持可能範囲（極座標系）
+  arm_reach_min: 0.10
+  arm_reach_max: 0.35
+  arm_yaw_min_deg: -90.0
+  arm_yaw_max_deg: 90.0
+
+cameras:
+  cam_fixed_side:
+    name: "アーム横固定"
+    type: "fixed"
+    x: 0.025
+    y: -0.12
+    z: 0.4546
+    pitch_deg: -56.2
+    fov_h_deg: 54.7
+    fov_v_deg: 42.1
+  cam_hand:
+    name: "アーム手先"
+    type: "moving"
+    attached_link: "gripper_link"
+    offset_x: 0.000999
+    offset_y: 0.068577
+    offset_z: -0.002866
+    roll_deg: 0.0
+    pitch_deg: 115.6
+    yaw_deg: 90
+    fov_h_deg: 63.1
+    fov_v_deg: 49.1
+
+datasets:
+  dataset_01_baseline:
+    name: "ベースライン用データセット"
+    num_cameras: 1
+    camera_ids: ["cam_fixed_side"]
+  dataset_02_multimodal:
+    name: "手先カメラ追加データセット"
+    num_cameras: 2
+    camera_ids: ["cam_fixed_side", "cam_hand"]
