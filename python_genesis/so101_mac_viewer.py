@@ -16,7 +16,8 @@
 # ============================================================
 import genesis as gs
 import numpy as np
-import json
+# import json
+import yaml
 import torch
 import torch.nn as nn
 import os
@@ -524,49 +525,64 @@ def run_keyboard_teleop():
     )
 
     # ──────────────────────────────────────────
-    # カメラ追加（build()の前に追加する必要がある）
-    # ──────────────────────────────────────────
-    CAM_W, CAM_H = 400, 300
-
-    # カメラ1: 真上からアーム全体を俯瞰
-    cam_overhead = scene.add_camera(
-        res=(CAM_W, CAM_H),
-        pos=(0.15, 0.0, 1.2),
-        lookat=(0.15, 0.0, 0.0),
-        fov=55,
-    )
-
-    # カメラ2: グリッパー追従（毎ステップset_poseで更新）
-    cam_wrist = scene.add_camera(
-        res=(CAM_W, CAM_H),
-        pos=(0.15, 0.0, 0.4),
-        lookat=(0.15, 0.0, 0.0),
-        fov=60,
-    )
-
-# ──────────────────────────────────────────
     # 📂 config JSONの読み込み と 幾何学計算
     # ──────────────────────────────────────────
-    config_path = os.path.join(parent_dir, "config", "env_config.json")
+    config_path = os.path.join(parent_dir, "config", "env_config.yaml")
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
-            env_config = json.load(f)
+            env_config = yaml.safe_load(f)
     except FileNotFoundError:
         print(f"⚠️ {config_path} が見つかりません。デフォルト値を使用します。")
         env_config = {
             "environment": {"mat_x_start": 0.13, "mat_y_start": -0.405, "mat_length": 0.30, "mat_width": 0.69, "mat_z_offset": 0.001, "desk_z_offset": -0.0054},
-            "cameras": {"cam_fixed_side": {"x": 0.025, "y": -0.12, "z": 0.4546, "pitch_deg": -56.2, "fov_h_deg": 54.7, "fov_v_deg": 42.1}}
+            "cameras": {"cam_fixed_side": {"x": 0.025, "y": -0.12, "z": 0.4546, "pitch_deg": -56.2, "fov_h_deg": 54.7, "fov_v_deg": 42.1},
+                        "cam_hand": {"fov_v_deg": 49.1}} # フォールバック用
         }
 
+# 各種設定データを抽出
     env_data = env_config["environment"]
-    cam_data = env_config["cameras"]["cam_fixed_side"]
+    cam_fixed_cfg = env_config["cameras"]["cam_fixed_side"]
+    cam_hand_cfg = env_config["cameras"]["cam_hand"]
 
     mat_x_start = env_data["mat_x_start"]
     mat_y_start = env_data["mat_y_start"]
     mat_length  = env_data["mat_length"]
     mat_width   = env_data["mat_width"]
     mat_z       = env_data.get("desk_z_offset", -0.0054) + env_data.get("mat_z_offset", 0.001)
+
+    # ──────────────────────────────────────────
+    # 📷 固定カメラの視線ベクトル（lookat）計算
+    # ──────────────────────────────────────────
+    fx, fy, fz = cam_fixed_cfg["x"], cam_fixed_cfg["y"], cam_fixed_cfg["z"]
+    pitch = np.deg2rad(cam_fixed_cfg["pitch_deg"])
+    
+    # ピッチ角から向いている方向（ベクトル）を計算し、カメラ位置に足して注視点を作る
+    cam_dir = np.array([np.cos(pitch), 0.0, np.sin(pitch)])
+    lookat_target = np.array([fx, fy, fz]) + cam_dir
+
+    # ──────────────────────────────────────────
+    # カメラ追加（build()の前に追加する必要がある）
+    # ──────────────────────────────────────────
+    CAM_W, CAM_H = 400, 300
+
+    # カメラ1: YAML設定に基づいた固定カメラ
+    cam_overhead = scene.add_camera(
+        res=(CAM_W, CAM_H),
+        pos=(fx, fy, fz),
+        lookat=lookat_target,
+        fov=cam_fixed_cfg["fov_v_deg"],
+    )
+
+    # カメラ2: グリッパー追従カメラ
+    # ※位置と注視点はシミュレーション中に毎ステップ上書きされるため、ここでは初期値(ダミー)でOK。
+    # ※ただし、視野角(fov)だけはここでYAMLの値を設定しておく必要があります。
+    cam_wrist = scene.add_camera(
+        res=(CAM_W, CAM_H),
+        pos=(0.15, 0.0, 0.4),
+        lookat=(0.15, 0.0, 0.0),
+        fov=cam_hand_cfg["fov_v_deg"],
+    )
 
     # --- アームの把持可能範囲（極座標パラメータ） ---
     arm_reach_min = env_data.get("arm_reach_min", 0.10)
@@ -584,16 +600,17 @@ def run_keyboard_teleop():
     shoulder_y = robot_y + shoulder_offset_y
 
 
-    cam_x, cam_y, cam_z = cam_data["x"], cam_data["y"], cam_data["z"]
+# ★修正：古い cam_data を cam_fixed_cfg に変更
+    cam_x, cam_y, cam_z = cam_fixed_cfg["x"], cam_fixed_cfg["y"], cam_fixed_cfg["z"]
 
     # --- 固定カメラの視野（FOV）ポリゴン計算 ---
-    pitch = np.deg2rad(cam_data["pitch_deg"])
+    pitch = np.deg2rad(cam_fixed_cfg["pitch_deg"])
     cam_dir   = np.array([np.cos(pitch), 0, np.sin(pitch)])
     cam_right = np.array([0, -1, 0])
     cam_up    = np.array([-np.sin(pitch), 0, np.cos(pitch)])
 
-    w = np.tan(np.deg2rad(cam_data["fov_h_deg"]) / 2)
-    h = np.tan(np.deg2rad(cam_data["fov_v_deg"]) / 2)
+    w = np.tan(np.deg2rad(cam_fixed_cfg["fov_h_deg"]) / 2)
+    h = np.tan(np.deg2rad(cam_fixed_cfg["fov_v_deg"]) / 2)
 
     rays = np.array([
         cam_dir + w * cam_right + h * cam_up,
