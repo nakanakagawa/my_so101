@@ -21,6 +21,10 @@ environment:
   arm_yaw_min_deg: -90.0
   arm_yaw_max_deg: 90.0
 
+  # 学習・リセット時のアーム初期姿勢（rad）
+  # [ベース回転, 肩ピッチ, 肘, 手首ピッチ, 手首ロール, グリッパー]
+  home_qpos: [0.0, -1.745, 1.536, 0.820, 0.0, -0.15] 
+
 cameras:
   cam_fixed_side:
     name: "アーム横固定"

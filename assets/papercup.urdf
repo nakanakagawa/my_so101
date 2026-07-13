@@ -10,7 +10,7 @@
     
     <!-- 視覚メッシュ (実機の形状) -->
     <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <origin xyz="0 0 0.002" rpy="0 0 0"/>
       <geometry>
         <!-- URDFとSTLが同階層にあるためファイル名のみ指定 -->
         <mesh filename="papercup.stl" scale="0.001 0.001 0.001"/>

@@ -10,7 +10,7 @@
     "mat_length": 0.30,
     "mat_width": 0.69,
     "mat_z_offset": 0.001,
-    "arm_reach_min": 0.10,
+    "arm_reach_min": 0.15,
     "arm_reach_max": 0.35,
     "arm_yaw_min_deg": -90.0,
     "arm_yaw_max_deg": 90.0

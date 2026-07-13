@@ -24,6 +24,8 @@ import os
 import re
 import urllib.request
 import matplotlib
+import time
+from scipy.spatial.transform import Rotation as R 
 matplotlib.use("Agg")   # ビューワーと競合しないバックエンド
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
@@ -492,16 +494,24 @@ def run_keyboard_teleop():
         )
 
     # ──────────────────────────────────────────
-    # 🧽 スポンジ（1個）の初期化
+    # 🧽 スポンジの初期化
     # ──────────────────────────────────────────
-    # スポンジ用の高摩擦マテリアル
     sponge_material = gs.materials.Rigid(
-        rho=500, friction=2.0, coup_friction=5.0, coup_restitution=0.1
+        rho=500, friction=5.0, coup_friction=5.0, coup_restitution=0.0
     )
+    
+    # 直方体の場合、サイズは (length, width, height) で指定します
+    # ここでは 4cm x 3cm x 2cm のスポンジを想定しています
+    sponge_size = (0.04, 0.03, 0.03)
+    
     sponge = scene.add_entity(
         material=sponge_material,
-        morph=gs.morphs.Box(size=(0.025, 0.025, 0.025), pos=(0.12, 0.08, 0.0125), fixed=False),
-        surface=gs.surfaces.Default(color=(1.0, 0.5, 0.0, 1.0)), # 見分けやすいようにオレンジ色に設定
+        morph=gs.morphs.Box(
+            size=sponge_size,
+            pos=(0.12, 0.08, sponge_size[2] / 2.0), # Z座標は高さの半分に設定
+            fixed=False
+        ),
+        surface=gs.surfaces.Default(color=(1.0, 0.5, 0.0, 1.0)),
     )
 
     # ──────────────────────────────────────────
@@ -551,6 +561,10 @@ def run_keyboard_teleop():
     mat_width   = env_data["mat_width"]
     mat_z       = env_data.get("desk_z_offset", -0.0054) + env_data.get("mat_z_offset", 0.001)
 
+
+    # --- アームの初期姿勢（ホームポジション）を読み込む ---
+    home_qpos = np.array(env_data.get("home_qpos", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), dtype=np.float32)
+
     # ──────────────────────────────────────────
     # 📷 固定カメラの視線ベクトル（lookat）計算
     # ──────────────────────────────────────────
@@ -572,6 +586,7 @@ def run_keyboard_teleop():
         pos=(fx, fy, fz),
         lookat=lookat_target,
         fov=cam_fixed_cfg["fov_v_deg"],
+        near=0.001,
     )
 
     # カメラ2: グリッパー追従カメラ
@@ -582,6 +597,7 @@ def run_keyboard_teleop():
         pos=(0.15, 0.0, 0.4),
         lookat=(0.15, 0.0, 0.0),
         fov=cam_hand_cfg["fov_v_deg"],
+        near=0.001,
     )
 
     # --- アームの把持可能範囲（極座標パラメータ） ---
@@ -628,7 +644,13 @@ def run_keyboard_teleop():
     # --- アームの把持可能範囲（ユーザー設定） ---
     ws_x_min = 0.02
     ws_x_max = 0.45
-    # ws_y_min, ws_y_max の制限も追加する場合はここに
+    # ws_y_min, ws_y_max の制限も追加する場合はここ
+
+    # 死角エリア
+    deadzone_x_min = 0.0
+    deadzone_x_max = 0.25
+    deadzone_y_min = 0
+    deadzone_y_max = 0.15 # 左端
 
     # ──────────────────────────────────────────
     # 📍 エリア判定関数（マット寸法 ＋ カメラ視野 ＋ 極座標アーム範囲）
@@ -651,6 +673,9 @@ def run_keyboard_teleop():
             return False
         if not (arm_yaw_min <= theta <= arm_yaw_max): 
             return False
+        # ★ 追加条件: 死角（除外長方形）に入っていないこと
+        if (deadzone_x_min <= x <= deadzone_x_max) and (deadzone_y_min <= y <= deadzone_y_max):
+            return False
             
         return True
 
@@ -669,42 +694,157 @@ def run_keyboard_teleop():
         surface=gs.surfaces.Default(color=(0.15, 0.15, 0.15, 1.0))
     )
 
-# ──────────────────────────────────────────
-    # 🟩 【デバッグ用】出現エリアの可視化（ホログラム仕様）
     # ──────────────────────────────────────────
-    print("有効エリアのマーカーを生成中...")
-    for x in np.arange(mat_x_start, mat_x_start + mat_length + 0.03, 0.03):
-        for y in np.arange(mat_y_start, mat_y_start + mat_width + 0.03, 0.03):
-            if is_valid_spawn_area(x, y):
-                scene.add_entity(
-                    morph=gs.morphs.Box(
-                        size=(0.008, 0.008, 0.001), 
-                        pos=(x, y, 0.0025), 
-                        fixed=True,
-                        collision=False  # 物理演算から除外
-                    ),
-                    surface=gs.surfaces.Default(color=(0.0, 1.0, 0.0, 0.7))
-                )
+    # 🟥 【デバッグ用】除外エリア（死角）の可視化
+    # ※1つの長方形を置くだけなので軽いです。調整が終わったらコメントアウト推奨。
+    # ──────────────────────────────────────────
+    dz_center_x = (deadzone_x_min + deadzone_x_max) / 2.0
+    dz_center_y = (deadzone_y_min + deadzone_y_max) / 2.0
+    dz_size_x = deadzone_x_max - deadzone_x_min
+    dz_size_y = deadzone_y_max - deadzone_y_min
+
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(dz_size_x, dz_size_y, 0.001), 
+            pos=(dz_center_x, dz_center_y, 0.003), # マットより少しだけ浮かせる
+            fixed=True,
+            collision=False  # アームがぶつからないように物理判定をオフ
+        ),
+        surface=gs.surfaces.Default(color=(1.0, 0.0, 0.0, 0.5)) # 赤色（半透明）
+    )
+
+    # ----------------------------------------------------
+
+    # # ──────────────────────────────────────────
+    # # 🟩 【デバッグ用】出現エリアの可視化（ホログラム仕様）
+    # # ──────────────────────────────────────────
+    # print("有効エリアのマーカーを生成中...")
+    # for x in np.arange(mat_x_start, mat_x_start + mat_length + 0.03, 0.03):
+    #     for y in np.arange(mat_y_start, mat_y_start + mat_width + 0.03, 0.03):
+    #         if is_valid_spawn_area(x, y):
+    #             scene.add_entity(
+    #                 morph=gs.morphs.Box(
+    #                     size=(0.008, 0.008, 0.001), 
+    #                     pos=(x, y, 0.0025), 
+    #                     fixed=True,
+    #                     collision=False  # 物理演算から除外
+    #                 ),
+    #                 surface=gs.surfaces.Default(color=(0.0, 1.0, 0.0, 0.7))
+    #             )
+
+    # ──────────────────────────────────────────
+    # 🔴 アゴ先端位置の確認用マーカー（赤い小球）
+    # ──────────────────────────────────────────
+    # 衝突判定を持たない視覚的なダミーオブジェクトとして配置します
+    marker = scene.add_entity(
+        morph=gs.morphs.Sphere(
+            radius=0.005,    # 半径5mmで視認しやすくする
+            pos=(0, 0, -1),  # 初期位置は邪魔にならない地下へ
+            fixed=True,
+            collision=False  # 物理的な衝突判定を無効化
+        ),
+        surface=gs.surfaces.Default(color=(1.0, 0.0, 0.0, 1.0)), # 赤色
+    )
+
 
     scene.build()
+    # ──────────────────────────────────────────
+    # PD制御ゲインの設定（腕は柔らかく、グリッパーは強烈に）
+    # ──────────────────────────────────────────
+    # ロボットの関節数（DOF数）を取得。SO-101なら通常6個です。
     n_dofs = robot.n_dofs
+
+    # ベースとなるゲイン（腕用）
+    kp_array = np.ones(n_dofs) * 200.0
+    kd_array = np.ones(n_dofs) * 20.0
+
+    # ★ グリッパーの関節インデックスを取得
+    try:
+        all_dofs = np.arange(robot.n_dofs)
+        gripper_idx = robot.get_joint("gripper").dof_idx_local
+        all_dofs = np.arange(n_dofs)
+        arm_idxs = np.delete(all_dofs, gripper_idx)
+        
+        MAX_GRASP_FORCE = 5.0
+        
+        # グリッパーの関節だけKPとKDを爆上げする
+        kp_array[gripper_idx] = 300.0
+        kd_array[gripper_idx] = 50.0
+        print(f"グリッパー(idx:{gripper_idx})のゲインを強化しました。")
+    except Exception as e:
+        print("グリッパーの関節名が見つかりません。URDFを確認してください:", e)
+
+    # ロボットにゲインを適用
+    robot.set_dofs_kp(kp_array)
+    robot.set_dofs_kv(kd_array)  # GenesisではKDをKV(Velocity Gain)と呼ぶことがあります
     print(f"✓ シーン構築完了 (DoF={n_dofs})")
 
-    def get_eef_pos():
-        try:
-            return robot.get_link("moving_jaw_so101_v1").get_pos().cpu().numpy()
-        except Exception:
-            return np.array([0.15, 0.0, 0.25], dtype=np.float32)
+    # def get_eef_pos():
+    #     try:
+    #         return robot.get_link("moving_jaw_so101_v1").get_pos().cpu().numpy()
+    #     except Exception:
+    #         return np.array([0.15, 0.0, 0.25], dtype=np.float32)
+
+    # def update_wrist_camera():
+    #     """グリッパー位置に追従してwristカメラを更新"""
+    #     eef = get_eef_pos()
+    #     # アームの根元方向（原点）を常に向く
+    #     cam_pos  = eef + np.array([0.0, 0.0, 0.12])   # グリッパーの12cm真上
+    #     lookat   = eef + np.array([0.0, 0.0, -0.08])  # グリッパー先端下向き
+    #     try:
+    #         cam_wrist.set_pose(pos=cam_pos, lookat=lookat)
+    #     except Exception:
+    #         pass
 
     def update_wrist_camera():
-        """グリッパー位置に追従してwristカメラを更新"""
-        eef = get_eef_pos()
-        # アームの根元方向（原点）を常に向く
-        cam_pos  = eef + np.array([0.0, 0.0, 0.12])   # グリッパーの12cm真上
-        lookat   = eef + np.array([0.0, 0.0, -0.08])  # グリッパー先端下向き
+        """gripper_linkの位置と回転を取得し、YAMLのオフセットと角度を適用してカメラを更新"""
         try:
-            cam_wrist.set_pose(pos=cam_pos, lookat=lookat)
-        except Exception:
+            # 1. gripper_linkの現在Pose（位置とクォータニオン）を取得
+            link = robot.get_link("gripper_link")
+            link_pos = link.get_pos().cpu().numpy()
+            link_quat_wxyz = link.get_quat().cpu().numpy()
+            
+            # SciPyは(x, y, z, w)順のクォータニオンを想定するため並び替え
+            link_quat_xyzw = np.array([
+                link_quat_wxyz[1], link_quat_wxyz[2], 
+                link_quat_wxyz[3], link_quat_wxyz[0]
+            ])
+            
+            from scipy.spatial.transform import Rotation as R
+            R_link = R.from_quat(link_quat_xyzw)
+            
+            # 2. カメラのワールド位置 (pos) の計算
+            offset = np.array([
+                cam_hand_cfg["offset_x"], 
+                cam_hand_cfg["offset_y"], 
+                cam_hand_cfg["offset_z"]
+            ])
+            cam_pos = link_pos + R_link.apply(offset)
+            
+            # 3. 視線(lookat)とアップベクトル(up)の計算
+            # YAMLの角度からローカルの回転を定義（※MATLABでのオイラー角定義に合わせています）
+            r = cam_hand_cfg["roll_deg"]
+            p = cam_hand_cfg["pitch_deg"]
+            y = cam_hand_cfg["yaw_deg"]
+            
+            # ※回転順序(XYZ, ZYX等)はURDFのカメラマウントの基準軸によって微調整が必要な場合があります
+            R_cam_local = R.from_euler('xyz', [r, p, y], degrees=True)
+            
+            # カメラのローカル座標系における前方ベクトル(+X)と上ベクトル(+Z)
+            local_forward = np.array([1.0, 0.0, 0.0])
+            local_up      = np.array([0.0, 0.0, 1.0])
+            
+            # ワールド座標系へのベクトル変換（リンクの回転 × カメラのローカル回転）
+            global_forward = R_link.apply(R_cam_local.apply(local_forward))
+            global_up      = R_link.apply(R_cam_local.apply(local_up))
+            
+            lookat = cam_pos + global_forward
+            
+            # 4. カメラ姿勢の適用（upベクトルを渡すことで、画像の傾き=Rollも正確に反映させる）
+            cam_wrist.set_pose(pos=cam_pos, lookat=lookat, up=global_up)
+            
+        except Exception as e:
+            # print(f"Wrist camera update error: {e}") # デバッグ用
             pass
 
     def grab_frame(cam):
@@ -737,11 +877,19 @@ def run_keyboard_teleop():
     dq = 0.03   # 1ステップあたりの関節角変化量
 
     # サーボ目標角度（現在位置で初期化）
-    target_qpos = robot.get_dofs_position().cpu().numpy().astype(np.float32)
+    # 変更前
+    # target_qpos = robot.get_dofs_position().cpu().numpy().astype(np.float32)
+    
+    # 変更後：サーボ目標角度（ホームポジションで初期化）
+    target_qpos = home_qpos.copy()
+    
+    # さらに、シミュレータ開始時のアーム位置も即座にホームポジションにテレポートさせます
+    robot.set_dofs_position(target_qpos)
 
     # PD制御ゲイン（実機サーボの保持力をイメージ）
     KP = 200.0   # 位置ゲイン（大きいほど保持力強）
     KD = 20.0    # 速度ゲイン（振動を抑える）
+
 
     def move_joint(idx, delta):
         current = robot.get_dofs_position().cpu().numpy().astype(np.float32)
@@ -757,7 +905,7 @@ def run_keyboard_teleop():
 
 
     def reset_scene():
-        target_qpos[:] = 0.0
+        target_qpos[:] = home_qpos.copy() #学習用の初期姿勢
         robot.set_dofs_position(target_qpos)
         rng = np.random.default_rng()
         
@@ -789,8 +937,13 @@ def run_keyboard_teleop():
             if dist >= MIN_DIST:
                 break
                 
-        sponge.set_pos(np.array([sp_x, sp_y, 0.0125], dtype=np.float32))
-        sponge.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+        # sponge.set_pos(np.array([sp_x, sp_y, 0.0125], dtype=np.float32))
+        # sponge.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+        # Z座標を 0.0125 から 0.02（円柱の半径）に変更し、床へのめり込みを防ぐ
+        sponge.set_pos(np.array([sp_x, sp_y, 0.02], dtype=np.float32))
+        
+        # X軸に90度回転させるクォータニオン (w, x, y, z) = (0.7071, 0.7071, 0, 0)
+        sponge.set_quat(np.array([0.7071, 0.7071, 0.0, 0.0], dtype=np.float32))
         
         print(f"↺ リセット完了 (生成範囲 X:{x_min:.2f}-{x_max:.2f}, Y:{y_min:.2f}-{y_max:.2f})")
 
@@ -827,10 +980,112 @@ def run_keyboard_teleop():
         Keybind("quit",  Key.ESCAPE, KeyAction.PRESS, callback=stop),
     )
 
+    low_fps_count = 0
+    last_time = time.perf_counter()
+    # ループの前にフラグを用意
+    is_grasping = False
     try:
         while is_running:
             apply_pd_control()
+            # 1. 現在の位置・速度を取得し、アーム用のPDトルクを計算
+            current_pos = robot.get_dofs_position().cpu().numpy().astype(np.float32)
+            current_vel = robot.get_dofs_velocity().cpu().numpy().astype(np.float32)
+            full_torque = KP * (target_qpos - current_pos) - KD * current_vel
+
+            # 2. グリッパーの力制御（減衰項付き）
+            g_target = target_qpos[gripper_idx]
+            g_current = current_pos[gripper_idx]
+            g_vel = current_vel[gripper_idx]
+            
+            LOWER_LIMIT = -0.174
+            UPPER_LIMIT = 1.745
+
+            # 速度に応じたブレーキ（ダンパ）を常に計算
+            damping_torque = -KD * g_vel
+
+            if g_target - g_current > 0.01:
+                if g_current >= UPPER_LIMIT:
+                    current_gripper_force = damping_torque 
+                else:
+                    # 目標に向かう力 ＋ 速度超過を防ぐブレーキ
+                    current_gripper_force = MAX_GRASP_FORCE + damping_torque
+            elif g_target - g_current < -0.01:
+                if g_current <= LOWER_LIMIT:
+                    current_gripper_force = damping_torque
+                else:
+                    current_gripper_force = -MAX_GRASP_FORCE + damping_torque
+            else:
+                # 目標付近ではダンパのみで振動を抑え込んで静止させる
+                current_gripper_force = damping_torque
+
+            # 3. アーム（位置追従トルク）とグリッパー（定トルク）を個別に適用
+            robot.control_dofs_force(full_torque[arm_idxs], arm_idxs)
+            robot.control_dofs_force(
+                np.array([current_gripper_force], dtype=np.float32), 
+                np.array([gripper_idx], dtype=np.int32)
+            )
             scene.step()
+
+            # ──────────────────────────────────────────
+            # 【プラン3 最終版】ステート管理型 仮想拘束
+            # ──────────────────────────────────────────
+            gripper_link = robot.get_link("gripper_link")
+            g_pos = gripper_link.get_pos().cpu().numpy()
+            g_quat = gripper_link.get_quat().cpu().numpy()
+            s_pos = sponge.get_pos().cpu().numpy()
+
+            # 1. 手先の「向き」を考慮して、実際のアゴの先端座標を計算
+            # Genesisのquat(w,x,y,z)をscipy用(x,y,z,w)に変換
+            rot = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
+            
+            # グリッパー基準座標からアゴ先端へのローカルオフセット（仮）
+            # ※ URDFや実際の見た目に合わせて調整してください（例: Z方向に-0.05など）
+            jaw_offset_local = np.array([0.01, 0.0, -0.09], dtype=np.float32)
+            
+            # 手先の回転を適用してワールド座標でのアゴ先端位置を算出
+            jaw_pos_world = g_pos + rot.apply(jaw_offset_local)
+
+            # ──────────────────────────────────────────
+            # 🔴 マーカーを現在の計算位置にリアルタイム同期
+            # ──────────────────────────────────────────
+            marker.set_pos(jaw_pos_world)
+
+            # 2. 条件判定用の変数を計算（距離は「アゴの先端」と「スポンジ」で測る）
+            dist = np.linalg.norm(jaw_pos_world - s_pos)
+            is_close = dist < 0.01
+            
+            g_angle = current_pos[gripper_idx]
+            PENETRATION_THRESHOLD = 0.8  # めり込み判定の閾値（要調整）
+            is_squeezing = g_angle < PENETRATION_THRESHOLD
+
+            # 【数値確認用】アゴを閉じようとしている時だけ、リアルタイムの数値を表示
+            if target_qpos[gripper_idx] > 0.01:
+                print(f"Dist: {dist:.4f} (目標<0.01) | Angle: {g_angle:.4f} (目標<{PENETRATION_THRESHOLD})", end="\r")
+
+            # 3. 状態遷移ロジック（ステートマシン）
+            if not is_grasping:
+                # 【掴んでいない状態】条件を満たしたら「把持状態」に移行
+                if target_qpos[gripper_idx] <= 0.20 and is_close and is_squeezing:
+                    is_grasping = True
+                    print(f"\n✅ 把持成功! (Dist: {dist:.3f}, Angle: {g_angle:.2f})")
+            else:
+                # 【掴んでいる状態】手を開く指令（目標値が0以下等）が出たら「解放」
+                # ※ 実機に合わせて解放条件の数値を調整してください
+                if target_qpos[gripper_idx] > 0.35:
+                    is_grasping = False
+                    print(f"\n手を開きました (RELEASE)")
+
+            # 4. 把持状態に基づく物理適用
+            if is_grasping:
+                # 掴んでいる間は、常にアゴの先端位置にスポンジを固定し続ける
+                sponge.set_pos(jaw_pos_world)
+                # 姿勢も手先に同期させる
+                sponge.set_quat(g_quat)
+                
+                # 物理エンジンの慣性で暴れるのを防ぐため、速度をリセット
+                # sponge.set_vel(np.array([0, 0, 0], dtype=np.float32))
+
+
 
             # カメラ更新（数ステップに1回）
             step_count += 1
@@ -855,11 +1110,32 @@ def run_keyboard_teleop():
                 cv2.imshow("wrist",    cv2.cvtColor(img_wrist,    cv2.COLOR_RGB2BGR))
                 cv2.waitKey(1)
 
+            # ──────────────────────────────────────────
+            # FPS低下による強制終了ロジック（whileループの末尾）
+            # ──────────────────────────────────────────
+            current_time = time.perf_counter()
+            dt_real = current_time - last_time
+            last_time = current_time
+
+            if dt_real > 0:
+                current_fps = 1.0 / dt_real
+                
+                if current_fps < 35.0:
+                    low_fps_count += 1
+                else:
+                    low_fps_count = 0
+                    
+                if low_fps_count >= 30:
+                    print("⚠️ FPSが30フレーム連続で35を下回ったため、シミュレーションを強制終了します。")
+                    break  # whileループを抜ける
+
     except KeyboardInterrupt:
         pass
     finally:
         cv2.destroyAllWindows()
         print("✓ キーボード操作モード終了")
+
+    
 
 
 # ============================================================
