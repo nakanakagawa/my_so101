@@ -984,6 +984,7 @@ def run_keyboard_teleop():
     last_time = time.perf_counter()
     # ループの前にフラグを用意
     is_grasping = False
+    relative_rot = None
     try:
         while is_running:
             apply_pd_control()
@@ -1061,6 +1062,8 @@ def run_keyboard_teleop():
             # 【数値確認用】アゴを閉じようとしている時だけ、リアルタイムの数値を表示
             if target_qpos[gripper_idx] > 0.01:
                 print(f"Dist: {dist:.4f} (目標<0.01) | Angle: {g_angle:.4f} (目標<{PENETRATION_THRESHOLD})", end="\r")
+# 【追加】スポンジの現在の姿勢も取得しておく
+            s_quat = sponge.get_quat().cpu().numpy()
 
             # 3. 状態遷移ロジック（ステートマシン）
             if not is_grasping:
@@ -1068,19 +1071,32 @@ def run_keyboard_teleop():
                 if target_qpos[gripper_idx] <= 0.20 and is_close and is_squeezing:
                     is_grasping = True
                     print(f"\n✅ 把持成功! (Dist: {dist:.3f}, Angle: {g_angle:.2f})")
+
+                    # 掴んだ瞬間の相対姿勢を保存
+                    rot_g = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
+                    rot_s = R.from_quat([s_quat[1], s_quat[2], s_quat[3], s_quat[0]])
+                    relative_rot = rot_g.inv() * rot_s
+
             else:
-                # 【掴んでいる状態】手を開く指令（目標値が0以下等）が出たら「解放」
-                # ※ 実機に合わせて解放条件の数値を調整してください
+                # 【掴んでいる状態】手を開く指令が出たら「解放」
                 if target_qpos[gripper_idx] > 0.35:
                     is_grasping = False
+                    relative_rot = None  # 離したらリセット
                     print(f"\n手を開きました (RELEASE)")
 
             # 4. 把持状態に基づく物理適用
             if is_grasping:
                 # 掴んでいる間は、常にアゴの先端位置にスポンジを固定し続ける
                 sponge.set_pos(jaw_pos_world)
-                # 姿勢も手先に同期させる
-                sponge.set_quat(g_quat)
+                
+                # 現在のグリッパーの姿勢に、保存しておいた相対姿勢を適用
+                rot_g_current = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
+                rot_s_new = rot_g_current * relative_rot
+                
+                # scipyの(x,y,z,w)からGenesisの(w,x,y,z)形式に戻してセット
+                q_new = rot_s_new.as_quat()
+                s_quat_genesis = np.array([q_new[3], q_new[0], q_new[1], q_new[2]], dtype=np.float32)
+                sponge.set_quat(s_quat_genesis)
                 
                 # 物理エンジンの慣性で暴れるのを防ぐため、速度をリセット
                 # sponge.set_vel(np.array([0, 0, 0], dtype=np.float32))
