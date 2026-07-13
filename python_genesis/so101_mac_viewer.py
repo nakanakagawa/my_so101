@@ -985,6 +985,7 @@ def run_keyboard_teleop():
     # ループの前にフラグを用意
     is_grasping = False
     relative_rot = None
+    relative_pos = None  # 【追加】掴んだ瞬間の相対位置を保持する変数
     try:
         while is_running:
             apply_pd_control()
@@ -1062,44 +1063,49 @@ def run_keyboard_teleop():
             # 【数値確認用】アゴを閉じようとしている時だけ、リアルタイムの数値を表示
             if target_qpos[gripper_idx] > 0.01:
                 print(f"Dist: {dist:.4f} (目標<0.01) | Angle: {g_angle:.4f} (目標<{PENETRATION_THRESHOLD})", end="\r")
-# 【追加】スポンジの現在の姿勢も取得しておく
+            # 【追加】スポンジの現在の姿勢も取得しておく
             s_quat = sponge.get_quat().cpu().numpy()
 
             # 3. 状態遷移ロジック（ステートマシン）
             if not is_grasping:
-                # 【掴んでいない状態】条件を満たしたら「把持状態」に移行
+                # 【掴んでいない状態】
                 if target_qpos[gripper_idx] <= 0.20 and is_close and is_squeezing:
                     is_grasping = True
                     print(f"\n✅ 把持成功! (Dist: {dist:.3f}, Angle: {g_angle:.2f})")
 
-                    # 掴んだ瞬間の相対姿勢を保存
+                    # ① 姿勢の相対差分を保存（既存）
                     rot_g = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
                     rot_s = R.from_quat([s_quat[1], s_quat[2], s_quat[3], s_quat[0]])
                     relative_rot = rot_g.inv() * rot_s
+                    
+                    # ② 【追加】位置の相対差分（ローカル座標系でのズレ）を保存
+                    # 現在の手先(g_pos)とスポンジ(s_pos)のワールド座標の差分を計算
+                    diff_pos = s_pos - g_pos
+                    # その差分を、グリッパーの回転の逆行列を使って「グリッパーから見たローカル座標」に変換
+                    relative_pos = rot_g.inv().apply(diff_pos)
 
             else:
-                # 【掴んでいる状態】手を開く指令が出たら「解放」
+                # 【掴んでいる状態】
                 if target_qpos[gripper_idx] > 0.35:
                     is_grasping = False
-                    relative_rot = None  # 離したらリセット
+                    relative_rot = None
+                    relative_pos = None  # 【追加】離したらリセット
                     print(f"\n手を開きました (RELEASE)")
 
             # 4. 把持状態に基づく物理適用
             if is_grasping:
-                # 掴んでいる間は、常にアゴの先端位置にスポンジを固定し続ける
-                sponge.set_pos(jaw_pos_world)
-                
-                # 現在のグリッパーの姿勢に、保存しておいた相対姿勢を適用
+                # 現在の手先の姿勢（回転）を取得
                 rot_g_current = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
-                rot_s_new = rot_g_current * relative_rot
                 
-                # scipyの(x,y,z,w)からGenesisの(w,x,y,z)形式に戻してセット
+                # 【変更】位置の更新：現在の手先位置(g_pos)に、現在の姿勢で回転させた相対位置を足す
+                s_pos_new = g_pos + rot_g_current.apply(relative_pos)
+                sponge.set_pos(s_pos_new)
+                
+                # 姿勢の更新（既存）
+                rot_s_new = rot_g_current * relative_rot
                 q_new = rot_s_new.as_quat()
                 s_quat_genesis = np.array([q_new[3], q_new[0], q_new[1], q_new[2]], dtype=np.float32)
                 sponge.set_quat(s_quat_genesis)
-                
-                # 物理エンジンの慣性で暴れるのを防ぐため、速度をリセット
-                # sponge.set_vel(np.array([0, 0, 0], dtype=np.float32))
 
 
 
