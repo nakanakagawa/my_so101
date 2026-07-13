@@ -986,6 +986,8 @@ def run_keyboard_teleop():
     is_grasping = False
     relative_rot = None
     relative_pos = None  # 【追加】掴んだ瞬間の相対位置を保持する変数
+    success_frame_count = 0
+
     try:
         while is_running:
             apply_pd_control()
@@ -1046,6 +1048,43 @@ def run_keyboard_teleop():
             
             # 手先の回転を適用してワールド座標でのアゴ先端位置を算出
             jaw_pos_world = g_pos + rot.apply(jaw_offset_local)
+
+            # ──────────────────────────────────────────
+            # 🎯 タスク成功判定（紙コップへの配置）
+            # ──────────────────────────────────────────
+            c_pos = cup.get_pos().cpu().numpy()
+            c_quat = cup.get_quat().cpu().numpy()
+            rot_c = R.from_quat([c_quat[1], c_quat[2], c_quat[3], c_quat[0]])
+            
+            diff_pos_cup = s_pos - c_pos
+            s_local_to_cup = rot_c.inv().apply(diff_pos_cup)
+            
+            # X, Yの判定も少し余裕を持たせ、Z（高さ）は大幅に広げる
+            in_x = abs(s_local_to_cup[0]) < 0.035
+            in_y = abs(s_local_to_cup[1]) < 0.035
+            # -1.5cm (底へのめり込み) 〜 6.0cm (コップから半分はみ出た状態) まで許容
+            in_z = -0.015 < s_local_to_cup[2] < 0.060 
+            
+            # 空間内にあり、かつアームが掴んでいないか
+            is_in_cup = in_x and in_y and in_z and not is_grasping
+            
+            if is_in_cup:
+                success_frame_count += 1
+            else:
+                success_frame_count = 0  # 外に出るか掴み直したら0にリセット
+            
+            # デバッグ表示（Zの高さと、キープしているフレーム数を監視）
+            dist_to_cup = np.linalg.norm(diff_pos_cup)
+            if dist_to_cup < 0.10:
+                print(f"Z:{s_local_to_cup[2]:.3f} | InZ:{in_z} | Count:{success_frame_count}/50    ", end="\r")
+            
+            # 50ステップ（約0.5秒）連続で条件をキープできたら成功
+            if success_frame_count == 50:
+                print(f"\n🎯 タスク完了: スポンジが紙コップに配置され、0.5秒間静止しました！")
+                
+                # 強化学習の場合はここで done = True を返します
+                # ※キーボード操作用で何度も判定させたくない場合は、適当なマイナス値を入れてクールダウンさせます
+                # success_frame_count = -100
 
             # ──────────────────────────────────────────
             # 🔴 マーカーを現在の計算位置にリアルタイム同期
