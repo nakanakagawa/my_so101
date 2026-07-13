@@ -12,48 +12,63 @@
     <visual>
       <origin xyz="0 0 0.002" rpy="0 0 0"/>
       <geometry>
-        <!-- URDFとSTLが同階層にあるためファイル名のみ指定 -->
-        <mesh filename="papercup.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="papercup2.stl" scale="0.001 0.001 0.001"/>
       </geometry>
       <material name="white">
         <color rgba="0.9 0.9 0.9 1"/>
       </material>
     </visual>
     
-    <!-- 衝突メッシュ1: 底面 -->
+    <!-- 衝突メッシュ1: 底面 (角を少し削るために小さく) -->
     <collision>
       <origin xyz="0 0 0.001" rpy="0 0 0"/>
       <geometry>
-        <box size="0.059 0.059 0.002"/>
+        <box size="0.045 0.045 0.002"/>
       </geometry>
     </collision>
-    <!-- 衝突メッシュ2: +X壁 -->
+
+    <!-- ========================================== -->
+    <!-- 8枚の壁で円柱を近似（厚さ2mm、幅25mm、高さ30mm） -->
+    <!-- ========================================== -->
+    <!-- 1: +X (0度) -->
     <collision>
       <origin xyz="0.0285 0 0.015" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.002 0.059 0.030"/>
-      </geometry>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
     </collision>
-    <!-- 衝突メッシュ3: -X壁 -->
+    <!-- 2: +X+Y (45度) -->
+    <collision>
+      <origin xyz="0.0201 0.0201 0.015" rpy="0 0 0.7854"/>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
+    </collision>
+    <!-- 3: +Y (90度) -->
+    <collision>
+      <origin xyz="0 0.0285 0.015" rpy="0 0 1.5708"/>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
+    </collision>
+    <!-- 4: -X+Y (135度) -->
+    <collision>
+      <origin xyz="-0.0201 0.0201 0.015" rpy="0 0 2.3562"/>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
+    </collision>
+    <!-- 5: -X (180度) -->
     <collision>
       <origin xyz="-0.0285 0 0.015" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.002 0.059 0.030"/>
-      </geometry>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
     </collision>
-    <!-- 衝突メッシュ4: +Y壁 -->
+    <!-- 6: -X-Y (225度) -->
     <collision>
-      <origin xyz="0 0.0285 0.015" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.055 0.002 0.030"/>
-      </geometry>
+      <origin xyz="-0.0201 -0.0201 0.015" rpy="0 0 0.7854"/>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
     </collision>
-    <!-- 衝突メッシュ5: -Y壁 -->
+    <!-- 7: -Y (270度) -->
     <collision>
-      <origin xyz="0 -0.0285 0.015" rpy="0 0 0"/>
-      <geometry>
-        <box size="0.055 0.002 0.030"/>
-      </geometry>
+      <origin xyz="0 -0.0285 0.015" rpy="0 0 1.5708"/>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
+    </collision>
+    <!-- 8: +X-Y (315度) -->
+    <collision>
+      <origin xyz="0.0201 -0.0201 0.015" rpy="0 0 2.3562"/>
+      <geometry><box size="0.002 0.025 0.030"/></geometry>
     </collision>
   </link>
 </robot>
