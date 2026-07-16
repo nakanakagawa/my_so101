@@ -76,6 +76,7 @@ else:
 # ============================================================
 CAM_W, CAM_H = 320, 240   # 学習時は小さめで省メモリ
 
+# 主にこのクラスを書き換えて環境をカスタマイズ．
 class SO101GraspEnv(gym.Env):
     """
     SO-101ロボットアームがキューブを把持して持ち上げるRL環境
@@ -89,9 +90,10 @@ class SO101GraspEnv(gym.Env):
     ACTION_SCALE     = 0.05
     DT               = 0.01
 
-    CUBE_X_MIN, CUBE_X_MAX = 0.05, 0.18
-    CUBE_Y_MIN, CUBE_Y_MAX = -0.25, -0.02
+    # CUBE_X_MIN, CUBE_X_MAX = 0.05, 0.18
+    # CUBE_Y_MIN, CUBE_Y_MAX = -0.25, -0.02
 
+    # 入出力のサイズ定義
     def __init__(self, render_mode=None, env_id=0):
         super().__init__()
         self.render_mode = render_mode
@@ -103,13 +105,16 @@ class SO101GraspEnv(gym.Env):
         except Exception:
             pass
 
+        # 設定のロードとシーン構築
+        self._load_config()
         self._build_scene()
 
         n = self.n_dofs
         obs_dim = 2 * n + 3 + self.N_CUBES * 3 + self.N_CUBES + 1
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
-        self.action_space      = spaces.Box(-1.0, 1.0, shape=(n,), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32) # AIが受け取る情報の形と範囲を定義
+        self.action_space      = spaces.Box(-1.0, 1.0, shape=(n,), dtype=np.float32) # AIが出力できる行動の範囲を定義(-1.0 〜 1.0 の連続値)
 
+    # 環境の初期化（シーン構築）
     def _build_scene(self):
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.DT, substeps=5),
@@ -143,15 +148,19 @@ class SO101GraspEnv(gym.Env):
         self.n_dofs = self.robot.n_dofs
         print(f"✓ 学習環境構築完了 (DoF={self.n_dofs}, キューブ={self.N_CUBES}個)")
 
+    # AIへの入力情報を取得する関数
     def _get_eef_pos(self) -> np.ndarray:
         try:
             return self.robot.get_link("moving_jaw_so101_v1").get_pos().cpu().numpy()
         except Exception:
             return np.array([0.10, -0.15, 0.28], dtype=np.float32)
 
+    
     def _get_cube_positions(self) -> np.ndarray:
         return np.stack([c.get_pos().cpu().numpy() for c in self.cubes])
+    
 
+    # AIへの入力情報をまとめる関数
     def _get_obs(self) -> np.ndarray:
         qpos      = self.robot.get_dofs_position().cpu().numpy()
         qvel      = self.robot.get_dofs_velocity().cpu().numpy()
@@ -160,7 +169,8 @@ class SO101GraspEnv(gym.Env):
         dists     = np.linalg.norm(cube_poss - eef_pos, axis=1)
         nearest   = np.array([float(np.argmin(dists))])
         return np.concatenate([qpos, qvel, eef_pos, cube_poss.flatten(), dists, nearest]).astype(np.float32)
-
+    
+    # 報酬関数
     def _compute_reward(self):
         eef_pos      = self._get_eef_pos()
         cube_poss    = self._get_cube_positions()
@@ -194,7 +204,8 @@ class SO101GraspEnv(gym.Env):
             self.scene.step()
 
         return self._get_obs(), {}
-
+    
+    # AIの行動を受け取り、環境を1ステップ進める関数
     def step(self, action: np.ndarray):
         self._step_count += 1
         current_qpos = self.robot.get_dofs_position().cpu().numpy()
@@ -330,6 +341,7 @@ class SO101ViewerEnv:
 # ============================================================
 # STEP 5: カスタムネットワーク
 # ============================================================
+# ニューラルネットワークの形をPyTorchで定義するクラス 使用する関数など
 class CustomMLP(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
         super().__init__(observation_space, features_dim)
@@ -347,6 +359,7 @@ class CustomMLP(BaseFeaturesExtractor):
 # ============================================================
 # STEP 6: 学習
 # ============================================================
+# 学習済みモデルを保存するディレクトリを作成し、PPOで学習を実行する関数
 def train():
     SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl")
     LOG_DIR  = os.path.join(SAVE_DIR, "logs")
