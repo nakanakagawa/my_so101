@@ -100,6 +100,13 @@ class SO101GraspEnv(gym.Env):
         self.env_id      = env_id
         self._step_count = 0
 
+        # --- 追加: 状態管理変数の初期化 ---
+        self.is_grasping = False
+        self.relative_rot = None
+        self.relative_pos = None
+        self.success_frame_count = 0
+        self._is_success = False
+
         try:
             gs.init(backend=gs.cpu, logging_level="warning")
         except Exception:
@@ -109,10 +116,91 @@ class SO101GraspEnv(gym.Env):
         self._load_config()
         self._build_scene()
 
-        n = self.n_dofs
-        obs_dim = 2 * n + 3 + self.N_CUBES * 3 + self.N_CUBES + 1
+        # --- 変更: 観測空間の次元数を再定義 ---
+        # qpos(6) + qvel(6) + アゴ先pos(3) + スポンジpos(3) + スポンジquat(4) + コップpos(3) + 把持フラグ(1) = 26次元
+        self.n_dofs = self.robot.n_dofs
+        obs_dim = 2 * self.n_dofs + 14 
         self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32) # AIが受け取る情報の形と範囲を定義
-        self.action_space      = spaces.Box(-1.0, 1.0, shape=(n,), dtype=np.float32) # AIが出力できる行動の範囲を定義(-1.0 〜 1.0 の連続値)
+        self.action_space      = spaces.Box(-1.0, 1.0, shape=(self.n_dofs,), dtype=np.float32) # AIが出力できる行動の範囲を定義(-1.0 〜 1.0 の連続値)
+
+    # [新規追加] テストコードで作成した設定読み込みロジックを移植
+    def _load_config(self):
+        """YAMLから設定を読み込み、出現可能エリアのポリゴンを計算する"""
+        import os
+        import yaml
+        from matplotlib.path import Path
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(script_dir) # my_so101 フォルダ
+        config_path = os.path.join(parent_dir, "config", "env_config.yaml")
+        self.cup_urdf_path = os.path.join(parent_dir, "assets", "papercup.urdf")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            env_config = yaml.safe_load(f)
+
+        env_data = env_config["environment"]
+        cam_cfg = env_config["cameras"]["cam_fixed_side"]
+
+        self.mat_x_start = env_data["mat_x_start"]
+        self.mat_y_start = env_data["mat_y_start"]
+        self.mat_length  = env_data["mat_length"]
+        self.mat_width   = env_data["mat_width"]
+        self.mat_z       = env_data.get("desk_z_offset", -0.0054) + env_data.get("mat_z_offset", 0.001)
+
+        self.arm_reach_min = env_data.get("arm_reach_min", 0.10)
+        self.arm_reach_max = env_data.get("arm_reach_max", 0.30)
+        self.arm_yaw_min   = np.deg2rad(env_data.get("arm_yaw_min_deg", -90.0))
+        self.arm_yaw_max   = np.deg2rad(env_data.get("arm_yaw_max_deg", 90.0))
+        
+        # ロボットの原点と肩のオフセット（テレオペ環境から）
+        self.shoulder_x = 0.04 + 0.0388
+        self.shoulder_y = 0.04 + 0.0
+        
+        # 死角エリア
+        self.deadzone_x_min, self.deadzone_x_max = 0.0, 0.25
+        self.deadzone_y_min, self.deadzone_y_max = 0.0, 0.15
+
+        # カメラ視野ポリゴンの計算
+        cam_x, cam_y, cam_z = cam_cfg["x"], cam_cfg["y"], cam_cfg["z"]
+        pitch = np.deg2rad(cam_cfg["pitch_deg"])
+        cam_dir   = np.array([np.cos(pitch), 0, np.sin(pitch)])
+        cam_right = np.array([0, -1, 0])
+        cam_up    = np.array([-np.sin(pitch), 0, np.cos(pitch)])
+
+        w = np.tan(np.deg2rad(cam_cfg["fov_h_deg"]) / 2)
+        h = np.tan(np.deg2rad(cam_cfg["fov_v_deg"]) / 2)
+
+        rays = np.array([
+            cam_dir + w * cam_right + h * cam_up,
+            cam_dir - w * cam_right + h * cam_up,
+            cam_dir - w * cam_right - h * cam_up,
+            cam_dir + w * cam_right - h * cam_up
+        ])
+
+        t = (self.mat_z - cam_z) / rays[:, 2]
+        intersect_pts = np.array([cam_x, cam_y, cam_z]) + t[:, np.newaxis] * rays
+        self.fov_poly = Path(intersect_pts[:, :2])
+
+        self.home_qpos = np.array(env_data.get("home_qpos", [0.0]*6), dtype=np.float32)
+
+    # [新規追加] テストコードで作成した配置判定ロジックを移植
+    def _is_valid_spawn_area(self, x, y):
+        """座標(x, y)が出現条件を満たしているか判定する"""
+        if not (self.mat_x_start <= x <= (self.mat_x_start + self.mat_length)): return False
+        if not (self.mat_y_start <= y <= (self.mat_y_start + self.mat_width)):  return False
+        if not self.fov_poly.contains_point((x, y)): return False
+
+        dx = x - self.shoulder_x
+        dy = y - self.shoulder_y
+        r = np.sqrt(dx**2 + dy**2)
+        theta = np.arctan2(dy, dx)
+
+        if not (self.arm_reach_min <= r <= self.arm_reach_max): return False
+        if not (self.arm_yaw_min <= theta <= self.arm_yaw_max): return False
+        if (self.deadzone_x_min <= x <= self.deadzone_x_max) and (self.deadzone_y_min <= y <= self.deadzone_y_max):
+            return False
+            
+        return True
 
     # 環境の初期化（シーン構築）
     def _build_scene(self):
@@ -122,6 +210,7 @@ class SO101GraspEnv(gym.Env):
         )
         self.scene.add_entity(gs.morphs.Plane())
 
+        # URDF読み込み
         try:
             self.robot = self.scene.add_entity(
                 gs.morphs.URDF(file=URDF_PATH, pos=(0, 0, 0), fixed=True)
@@ -132,21 +221,27 @@ class SO101GraspEnv(gym.Env):
                 gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml")
             )
 
-        default_positions = [
-            (0.12, -0.08, 0.02), (0.12,  0.08, 0.02),
-            (0.16,  0.00, 0.02), (0.18, -0.08, 0.02),
-            (0.18,  0.08, 0.02),
-        ]
-        self.cubes = [
-            self.scene.add_entity(
-                gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=p, fixed=False)
-            )
-            for p in default_positions
-        ]
+        # --- 変更: キューブ5個を削除し、スポンジと紙コップを追加 ---
+        self.sponge = self.scene.add_entity(
+            material=gs.materials.Rigid(rho=500, friction=5.0, coup_friction=5.0),
+            morph=gs.morphs.Box(size=(0.04, 0.03, 0.03), pos=(0.1, 0, 0.1), fixed=False),
+            surface=gs.surfaces.Default(color=(0.6, 1.0, 0.0, 1.0)) # 黄緑色
+        )
+        
+        self.cup = self.scene.add_entity(
+            material=gs.materials.Rigid(rho=500, friction=2.0, coup_friction=3.0),
+            morph=gs.morphs.URDF(file=self.cup_urdf_path, pos=(0.1, 0.1, 0.1), fixed=False)
+        )
+
 
         self.scene.build()
         self.n_dofs = self.robot.n_dofs
-        print(f"✓ 学習環境構築完了 (DoF={self.n_dofs}, キューブ={self.N_CUBES}個)")
+
+        # --- 追加: グリッパーの関節インデックスを取得 ---
+        try:
+            self.gripper_idx = self.robot.get_joint("gripper").dof_idx_local
+        except Exception:
+            self.gripper_idx = 5
 
     # AIへの入力情報を取得する関数
     def _get_eef_pos(self) -> np.ndarray:
@@ -162,43 +257,120 @@ class SO101GraspEnv(gym.Env):
 
     # AIへの入力情報をまとめる関数
     def _get_obs(self) -> np.ndarray:
+        # ロボットの関節角度と速度
         qpos      = self.robot.get_dofs_position().cpu().numpy()
         qvel      = self.robot.get_dofs_velocity().cpu().numpy()
-        eef_pos   = self._get_eef_pos()
-        cube_poss = self._get_cube_positions()
-        dists     = np.linalg.norm(cube_poss - eef_pos, axis=1)
-        nearest   = np.array([float(np.argmin(dists))])
-        return np.concatenate([qpos, qvel, eef_pos, cube_poss.flatten(), dists, nearest]).astype(np.float32)
+
+        # --- 変更: 各オブジェクトの正確な状態を取得 ---
+        # ※ _get_jaw_pos() は手先の回転を考慮してアゴ先端を計算する自作関数とします
+        eef_pos = self._get_jaw_pos() 
+        s_pos = self.sponge.get_pos().cpu().numpy()
+        s_quat = self.sponge.get_quat().cpu().numpy()
+        c_pos = self.cup.get_pos().cpu().numpy()
+
+        # 把持しているかどうかのフラグを数値(0.0 または 1.0)として追加
+        grasp_flag = np.array([1.0 if self.is_grasping else 0.0], dtype=np.float32)
+
+        # 取得した全要素を1つの1次元配列に結合（要素数は必ず obs_dim と一致させる）
+        obs = np.concatenate([qpos, qvel, eef_pos, s_pos, s_quat, c_pos, grasp_flag])
+        return obs.astype(np.float32)
     
     # 報酬関数
     def _compute_reward(self):
-        eef_pos      = self._get_eef_pos()
-        cube_poss    = self._get_cube_positions()
-        dists        = np.linalg.norm(cube_poss - eef_pos, axis=1)
-        nearest_idx  = int(np.argmin(dists))
-        nearest_dist = dists[nearest_idx]
-        nearest_z    = float(cube_poss[nearest_idx, 2])
+        # [変更] 全キューブの座標を取得する処理を削除し、アゴ先・スポンジ・コップの座標取得に変更
+        jaw_pos = self._get_jaw_pos()
+        s_pos = self.sponge.get_pos().cpu().numpy()
+        c_pos = self.cup.get_pos().cpu().numpy()
 
-        reward_reach   = -nearest_dist * 1.5
-        reward_lift    = max(0.0, nearest_z - 0.02) * 8.0
-        success        = nearest_z > self.CUBE_LIFT_HEIGHT
-        reward_success = 30.0 if success else 0.0
+        # [変更] 「最も近いキューブ」への接近報酬を、「スポンジ」への接近報酬に置き換え
+        dist_to_sponge = float(np.linalg.norm(jaw_pos - s_pos))
+        reward_reach = -dist_to_sponge * 2.0
 
-        return float(reward_reach + reward_lift + reward_success - 0.01), success
+        # [変更] Z座標が0.02を超えたら加点するロジックを応用し、把持判定を組み合わせた持ち上げ報酬に改修
+        reward_lift = 0.0
+        if self.is_grasping:
+            reward_lift = 2.0 + max(0.0, s_pos[2] - 0.02) * 10.0
+
+        # [新規追加] スポンジを掴んだ状態で紙コップへ近づくための運搬報酬
+        reward_move = 0.0
+        if self.is_grasping:
+            dist_to_cup = float(np.linalg.norm(s_pos - c_pos))
+            reward_move = -dist_to_cup * 2.0
+
+        # [変更] 高さが0.07を超えたら成功とする条件を、_is_successフラグによる成功判定に変更
+        reward_success = 50.0 if self._is_success else 0.0
+
+        # [元コード流用] 各報酬の合計値を計算
+        total_reward = float(reward_reach + reward_lift + reward_move + reward_success)
+
+        # [新規追加] TensorBoardで各報酬の推移を個別に可視化するための内訳辞書
+        info = {
+            "reward_reach": reward_reach,
+            "reward_lift": reward_lift,
+            "reward_move": reward_move,
+            "reward_success": reward_success,
+            "is_success": self._is_success
+        }
+        
+        # [変更] successフラグを直接返すのではなく、info辞書を返す仕様に変更
+        return total_reward, info
+    
+    # [完全新規追加] テレオペ環境のロジックから移植
+    def _get_jaw_pos(self) -> np.ndarray:
+        """手先の回転を考慮したアゴ先端の正確な座標を取得"""
+        # [新規追加] グリッパーのリンク位置と姿勢を取得
+        gripper_link = self.robot.get_link("gripper_link")
+        g_pos = gripper_link.get_pos().cpu().numpy()
+        g_quat = gripper_link.get_quat().cpu().numpy()
+        
+        # [新規追加] クォータニオンから回転行列を生成
+        from scipy.spatial.transform import Rotation as R
+        rot = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
+        
+        # [新規追加] グリッパー基準座標からアゴ先端へのローカルオフセット（Z方向に-9cm）
+        jaw_offset_local = np.array([0.01, 0.0, -0.09], dtype=np.float32)
+        
+        # [新規追加] ローカルオフセットに回転を適用し、ワールド座標を算出
+        return g_pos + rot.apply(jaw_offset_local)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self._step_count = 0
+        # self._step_count = 0
         rng = np.random.default_rng(seed)
 
-        self.robot.set_dofs_position(np.zeros(self.n_dofs, dtype=np.float32))
+        # --- ① 状態・カウンターの初期化（前エピソードの情報を消去） ---
+        self._step_count = 0
+        self.is_grasping = False
+        self.relative_rot = None
+        self.relative_pos = None
+        self.success_frame_count = 0
+        self._is_success = False
+
+        # --- ② ロボットの初期化 ---
+        self.robot.set_dofs_position(self.home_qpos)
         self.robot.set_dofs_velocity(np.zeros(self.n_dofs, dtype=np.float32))
 
-        for cube in self.cubes:
-            cx = rng.uniform(self.CUBE_X_MIN, self.CUBE_X_MAX)
-            cy = rng.uniform(self.CUBE_Y_MIN, self.CUBE_Y_MAX)
-            cube.set_pos(np.array([cx, cy, 0.02], dtype=np.float32))
-            cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+        # --- ③ 対象物のランダム配置 ---
+        x_min, x_max = self.mat_x_start, self.mat_x_start + self.mat_length
+        y_min, y_max = self.mat_y_start, self.mat_y_start + self.mat_width
+
+        # 紙コップの配置
+        while True:
+            cup_x, cup_y = rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)
+            if self._is_valid_spawn_area(cup_x, cup_y): 
+                break
+        self.cup.set_pos(np.array([cup_x, cup_y, 0.015], dtype=np.float32))
+        self.cup.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+
+        # スポンジの配置（コップから6cm以上離す）
+        while True:
+            sp_x, sp_y = rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)
+            if not self._is_valid_spawn_area(sp_x, sp_y): 
+                continue
+            if np.sqrt((sp_x - cup_x)**2 + (sp_y - cup_y)**2) >= 0.06: 
+                break
+        self.sponge.set_pos(np.array([sp_x, sp_y, 0.02], dtype=np.float32))
+        self.sponge.set_quat(np.array([0.7071, 0.7071, 0.0, 0.0], dtype=np.float32))
 
         for _ in range(10):
             self.scene.step()
@@ -208,17 +380,82 @@ class SO101GraspEnv(gym.Env):
     # AIの行動を受け取り、環境を1ステップ進める関数
     def step(self, action: np.ndarray):
         self._step_count += 1
+
+
         current_qpos = self.robot.get_dofs_position().cpu().numpy()
         delta        = np.clip(action, -1.0, 1.0) * self.ACTION_SCALE
         target_qpos  = np.clip(current_qpos + delta, -np.pi, np.pi)
         self.robot.set_dofs_position(target_qpos.astype(np.float32))
         self.scene.step()
 
+        # [新規追加] 対象物の現在座標と姿勢を取得（仮想拘束・内外判定用）
+        gripper_link = self.robot.get_link("gripper_link")
+        g_pos = gripper_link.get_pos().cpu().numpy()
+        g_quat = gripper_link.get_quat().cpu().numpy()
+        s_pos = self.sponge.get_pos().cpu().numpy()
+        s_quat = self.sponge.get_quat().cpu().numpy()
+        jaw_pos = self._get_jaw_pos()
+
+        # [新規追加] テレオペ環境から移植した仮想拘束（把持）のロジック群 ----------
+        dist = float(np.linalg.norm(jaw_pos - s_pos))
+        is_close = dist < 0.01
+        g_angle = target_qpos[self.gripper_idx]
+        is_squeezing = g_angle <= 0.20
+
+        if not self.is_grasping:
+            if is_close and is_squeezing:
+                self.is_grasping = True
+                rot_g = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
+                rot_s = R.from_quat([s_quat[1], s_quat[2], s_quat[3], s_quat[0]])
+                self.relative_rot = rot_g.inv() * rot_s
+                self.relative_pos = rot_g.inv().apply(s_pos - g_pos)
+        else:
+            if g_angle > 0.35:
+                self.is_grasping = False
+                self.relative_rot = None
+                self.relative_pos = None
+
+        if self.is_grasping:
+            rot_g_current = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
+            self.sponge.set_pos(g_pos + rot_g_current.apply(self.relative_pos))
+            q_new = (rot_g_current * self.relative_rot).as_quat()
+            self.sponge.set_quat(np.array([q_new[3], q_new[0], q_new[1], q_new[2]], dtype=np.float32))
+
+        # ----------------------------------------------------------------------
+
+        # [新規追加] テレオペ環境から移植した紙コップの内外判定ロジック群 ----------
+        c_pos = self.cup.get_pos().cpu().numpy()
+        c_quat = self.cup.get_quat().cpu().numpy()
+        rot_c = R.from_quat([c_quat[1], c_quat[2], c_quat[3], c_quat[0]])
+        s_local_to_cup = rot_c.inv().apply(s_pos - c_pos)
+        
+        in_x = abs(s_local_to_cup[0]) < 0.035
+        in_y = abs(s_local_to_cup[1]) < 0.035
+        in_z = -0.015 < s_local_to_cup[2] < 0.060
+        is_in_cup = in_x and in_y and in_z and not self.is_grasping
+
+        if is_in_cup:
+            self.success_frame_count += 1
+        else:
+            self.success_frame_count = 0
+            
+        if self.success_frame_count >= 50:
+            self._is_success = True
+        # ----------------------------------------------------------------------
+
         obs = self._get_obs()
-        reward, success = self._compute_reward()
-        terminated = success
-        truncated  = self._step_count >= self.MAX_STEPS
-        return obs, reward, terminated, truncated, {"success": success}
+
+        # [変更] info辞書を受け取る形に修正
+        reward, info = self._compute_reward()
+        
+        # [変更] キューブが0.07以上持ち上がったかどうかの判定を削除し、_is_successフラグに変更
+        terminated = self._is_success
+        
+        # [元コード流用] タイムアウト（最大ステップ到達）の判定
+        truncated = self._step_count >= self.MAX_STEPS
+
+        # [変更] successフラグを直接返すのではなく、info辞書を含めて返すように修正
+        return obs, reward, terminated, truncated, info
 
     def close(self):
         pass
