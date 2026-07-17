@@ -94,11 +94,12 @@ class SO101GraspEnv(gym.Env):
     # CUBE_Y_MIN, CUBE_Y_MAX = -0.25, -0.02
 
     # 入出力のサイズ定義
-    def __init__(self, render_mode=None, env_id=0):
+    def __init__(self, render_mode=None, env_id=0, show_viewer=False):
         super().__init__()
         self.render_mode = render_mode
         self.env_id      = env_id
         self._step_count = 0
+        self.show_viewer = show_viewer
 
         # --- 追加: 状態管理変数の初期化 ---
         self.is_grasping = False
@@ -206,7 +207,11 @@ class SO101GraspEnv(gym.Env):
     def _build_scene(self):
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.DT, substeps=5),
-            show_viewer=False,   # 学習中はビューワー非表示
+            show_viewer=self.show_viewer,   # 学習中はビューワー非表示
+            viewer_options=gs.options.ViewerOptions(
+                camera_pos=(0.8, -0.8, 0.6),
+                camera_lookat=(0.15, 0.0, 0.1),
+            ) if self.show_viewer else None # ← ビューワーON時のみカメラ設定を渡す
         )
         self.scene.add_entity(gs.morphs.Plane())
 
@@ -1460,10 +1465,18 @@ def run_viewer_demo(model, n_episodes: int = 5):
     print("\n--- Macビューワーでリアルタイムデモを開始 ---")
     print("ビューワーウィンドウを閉じると終了します。\n")
 
-    env = SO101ViewerEnv()
+    # env = SO101ViewerEnv()
+
+    # [変更] 古いSO101ViewerEnvは捨て、最新の本番環境をビューワーONで呼び出す
+    env = SO101GraspEnv(show_viewer=True)
+    
+    # [変更] ダミー環境を使わずに直接モデルをロードする
+    model = PPO.load(model_path, device="cpu")
 
     for ep in range(n_episodes):
-        obs      = env.reset(seed=ep)
+        # [変更] Gymnasiumの仕様に合わせて obs, info で受け取る
+        obs, _   = env.reset(seed=ep)
+        # obs      = env.reset(seed=ep)
         done     = False
         total_r  = 0.0
         step     = 0
@@ -1473,10 +1486,20 @@ def run_viewer_demo(model, n_episodes: int = 5):
 
         while not done and step < MAX_STEP:
             action, _ = model.predict(obs, deterministic=True)
-            obs, success = env.step(action)
+            # obs, success = env.step(action)
+            # 【修正箇所】戻り値を2つではなく、5つの変数で受け取る
+            obs, reward, terminated, truncated, info = env.step(action)
             step += 1
 
-            if success:
+            # if success:
+            #     print(f"  ✓ SUCCESS! ({step}ステップ)")
+            #     done = True
+
+            # 終了判定（成功したか、最大ステップに達したか）
+            done = terminated or truncated
+
+            # info辞書から成功フラグを取り出す
+            if info.get("is_success", False):
                 print(f"  ✓ SUCCESS! ({step}ステップ)")
                 done = True
 
@@ -1549,17 +1572,23 @@ if __name__ == "__main__":
             ]
             model_path = next((p for p in candidates if os.path.exists(p)), None)
 
-        if args.mode == "demo":
-            if model_path and os.path.exists(model_path):
-                print(f"モデルをロード: {model_path}")
-                dummy_env = VecMonitor(DummyVecEnv([lambda: SO101GraspEnv()]))
-                model = PPO.load(model_path, env=dummy_env, device="cpu")
-                dummy_env.close()
-            else:
-                print("⚠️ モデルが見つかりません。先に --mode train を実行してください。")
-                raise SystemExit
+        # if args.mode == "demo":
+        #     if model_path and os.path.exists(model_path):
+        #         print(f"モデルをロード: {model_path}")
+        #         dummy_env = VecMonitor(DummyVecEnv([lambda: SO101GraspEnv()]))
+        #         model = PPO.load(model_path, env=dummy_env, device="cpu")
+        #         dummy_env.close()
+        #     else:
+        #         print("⚠️ モデルが見つかりません。先に --mode train を実行してください。")
+        #         raise SystemExit
 
-        run_viewer_demo(model, n_episodes=args.episodes)
+        if not model_path or not os.path.exists(model_path):
+            print("⚠️ モデルが見つかりません。先に --mode train を実行してください。")
+            raise SystemExit
+
+        # run_viewer_demo(model, n_episodes=args.episodes)
+        # [変更] ダミー環境をロードする処理を削除し、パスだけを渡す
+        run_viewer_demo(model_path, n_episodes=args.episodes)
 
     print("\n✅ 完了!")
     if args.mode in ("train", "traindemo"):
