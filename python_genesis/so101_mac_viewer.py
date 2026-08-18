@@ -282,42 +282,104 @@ class SO101GraspEnv(gym.Env):
     
     # 報酬関数
     def _compute_reward(self):
-        # [変更] 全キューブの座標を取得する処理を削除し、アゴ先・スポンジ・コップの座標取得に変更
         jaw_pos = self._get_jaw_pos()
         s_pos = self.sponge.get_pos().cpu().numpy()
         c_pos = self.cup.get_pos().cpu().numpy()
-
-        # [変更] 「最も近いキューブ」への接近報酬を、「スポンジ」への接近報酬に置き換え
         dist_to_sponge = float(np.linalg.norm(jaw_pos - s_pos))
-        reward_reach = -dist_to_sponge * 2.0
 
-        # [変更] Z座標が0.02を超えたら加点するロジックを応用し、把持判定を組み合わせた持ち上げ報酬に改修
+        # --------------------------------------------------
+        # 1. 接近ペナルティ（XYのズレを重くし、真上からのアプローチを誘導）
+        # --------------------------------------------------
+        reward_reach = 0.0
+        if not self.is_grasping:
+            dx = jaw_pos[0] - s_pos[0]
+            dy = jaw_pos[1] - s_pos[1]
+            dz = jaw_pos[2] - s_pos[2]
+            
+            xy_dist = float(np.sqrt(dx**2 + dy**2))
+            z_dist = float(abs(dz))
+            
+            # XY（水平）のズレのペナルティを大きく(3.0)し、位置決め精度を強制する
+            reward_reach = -(xy_dist * 3.0 + z_dist * 1.5)
+
+        # --------------------------------------------------
+        # 1.5. 姿勢ペナルティ（手先を真下に向けさせる）
+        # --------------------------------------------------
+        reward_orientation = 0.0
+        if not self.is_grasping:
+            # グリッパーの現在のクォータニオンを取得して回転行列にする
+            gripper_link = self.robot.get_link("gripper_link")
+            g_quat = gripper_link.get_quat().cpu().numpy()
+            rot = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
+            
+            # アゴが伸びているローカル方向（-Z方向）をワールド座標の方向に変換
+            jaw_dir_local = np.array([0.0, 0.0, -1.0])
+            jaw_dir_world = rot.apply(jaw_dir_local)
+            
+            # ワールド座標の「真下」ベクトル
+            down_dir_world = np.array([0.0, 0.0, -1.0])
+            
+            # 内積（dot）を計算: 完全に下を向いていれば 1.0、水平なら 0.0
+            dot = np.dot(jaw_dir_world, down_dir_world)
+            
+            # 1.0（真下）からズレている分だけペナルティを与える（係数0.1でマイルドに）
+            reward_orientation = -(1.0 - dot) * 0.1
+
+        # --------------------------------------------------
+        # 2. グリッパー開度ペナルティ（滑らかなプレシェイプの誘導）
+        # --------------------------------------------------
+        reward_gripper = 0.0
+        if not self.is_grasping:
+            current_qpos = self.robot.get_dofs_position().cpu().numpy()
+            gripper_angle = current_qpos[self.gripper_idx]
+            
+            # 【重要】距離10cmで45度、距離1cm以下で0度になるように「比例」させる
+            # これにより、急激な指令を避け、近づくにつれて滑らかに手を閉じる動作を誘導する
+            ratio = np.clip((dist_to_sponge - 0.01) / 0.09, 0.0, 1.0)
+            target_angle = ratio * (45.0 * np.pi / 180.0)
+            
+            diff = abs(gripper_angle - target_angle)
+            # ペナルティを強めに設定し、指示通りに指を動かさないと容赦なく減点する
+            reward_gripper = -diff * 0.1
+
+        # --------------------------------------------------
+        # 3. 持ち上げ姿勢のペナルティ（生存ボーナスの廃止）
+        # --------------------------------------------------
         reward_lift = 0.0
         if self.is_grasping:
-            reward_lift = 2.0 + max(0.0, s_pos[2] - 0.02) * 10.0
+            # 毎ステップの加点（ハッキングの温床）を完全に廃止。
+            # 代わりに、コップを横からなぎ倒さないよう、高さ(Z)が10cm未満の場合に減点を与える
+            if s_pos[2] < 0.10:
+                reward_lift = -abs(0.10 - s_pos[2]) * 5.0
 
-        # [新規追加] スポンジを掴んだ状態で紙コップへ近づくための運搬報酬
+        # --------------------------------------------------
+        # 4. 運搬ペナルティ
+        # --------------------------------------------------
         reward_move = 0.0
         if self.is_grasping:
+            # 把持中はコップへの距離を毎ステップ減点する。
+            # これにより「空中で待機」すると減点され続けるため、最短でコップへ向かうようになる
             dist_to_cup = float(np.linalg.norm(s_pos - c_pos))
             reward_move = -dist_to_cup * 2.0
 
-        # [変更] 高さが0.07を超えたら成功とする条件を、_is_successフラグによる成功判定に変更
+        # --------------------------------------------------
+        # 5. 成功報酬（終端報酬）
+        # --------------------------------------------------
+        # コップに入れた瞬間だけ巨大な報酬を与える
         reward_success = 50.0 if self._is_success else 0.0
 
-        # [元コード流用] 各報酬の合計値を計算
-        total_reward = float(reward_reach + reward_lift + reward_move + reward_success)
+        total_reward = float(reward_reach + reward_gripper + reward_lift + reward_move + reward_success)
 
-        # [新規追加] TensorBoardで各報酬の推移を個別に可視化するための内訳辞書
         info = {
             "reward_reach": reward_reach,
+            "reward_orientation": reward_orientation,
+            "reward_gripper": reward_gripper,
             "reward_lift": reward_lift,
             "reward_move": reward_move,
             "reward_success": reward_success,
             "is_success": self._is_success
         }
         
-        # [変更] successフラグを直接返すのではなく、info辞書を返す仕様に変更
         return total_reward, info
     
     # [完全新規追加] テレオペ環境のロジックから移植
@@ -390,6 +452,16 @@ class SO101GraspEnv(gym.Env):
         current_qpos = self.robot.get_dofs_position().cpu().numpy()
         delta        = np.clip(action, -1.0, 1.0) * self.ACTION_SCALE
         target_qpos  = np.clip(current_qpos + delta, -np.pi, np.pi)
+        # --------------------------------------------------
+        # [追加] グリッパーの可動域を強制クリップ（めり込み・過剰回転防止）
+        # --------------------------------------------------
+        GRIPPER_MIN = -0.174  # 完全に閉じた状態の限界値
+        GRIPPER_MAX = 1.745   # 完全に開いた状態の限界値
+        target_qpos[self.gripper_idx] = np.clip(
+            target_qpos[self.gripper_idx], 
+            GRIPPER_MIN, 
+            GRIPPER_MAX
+        )
         self.robot.set_dofs_position(target_qpos.astype(np.float32))
         self.scene.step()
 
@@ -603,7 +675,7 @@ class CustomMLP(BaseFeaturesExtractor):
 # ============================================================
 # 学習済みモデルを保存するディレクトリを作成し、PPOで学習を実行する関数
 def train():
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl25")
     LOG_DIR  = os.path.join(SAVE_DIR, "logs")
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(LOG_DIR,  exist_ok=True)
@@ -654,7 +726,7 @@ def train():
         eval_freq=20_000, n_eval_episodes=10, deterministic=True, render=False,
     )
 
-    TOTAL_TIMESTEPS = 60_000
+    TOTAL_TIMESTEPS = 200_000
     print(f"学習開始: {TOTAL_TIMESTEPS:,} ステップ\n")
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
@@ -1541,7 +1613,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl25")
 
     # --------------------------------------------------
     # 引数なし → キーボードテレオペで環境確認
