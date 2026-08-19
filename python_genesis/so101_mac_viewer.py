@@ -288,7 +288,7 @@ class SO101GraspEnv(gym.Env):
         dist_to_sponge = float(np.linalg.norm(jaw_pos - s_pos))
 
         # --------------------------------------------------
-        # 1. 接近ペナルティ（XYのズレを重くし、真上からのアプローチを誘導）
+        # 1. 接近ペナルティ（係数を元に戻し、動くメリットを復活させる）
         # --------------------------------------------------
         reward_reach = 0.0
         if not self.is_grasping:
@@ -299,76 +299,79 @@ class SO101GraspEnv(gym.Env):
             xy_dist = float(np.sqrt(dx**2 + dy**2))
             z_dist = float(abs(dz))
             
-            # XY（水平）のズレのペナルティを大きく(3.0)し、位置決め精度を強制する
-            reward_reach = -(xy_dist * 3.0 + z_dist * 1.5)
+            # 【変更】距離を詰めるメリットを明確にするため、係数を(3.0, 1.5)に戻す。オフセットは -0.15。
+            reward_reach = -(xy_dist * 3.0 + z_dist * 1.5) - 0.15
 
         # --------------------------------------------------
-        # 1.5. 姿勢ペナルティ（手先を真下に向けさせる）
+        # 1.5. 姿勢ペナルティ
         # --------------------------------------------------
         reward_orientation = 0.0
         if not self.is_grasping:
-            # グリッパーの現在のクォータニオンを取得して回転行列にする
             gripper_link = self.robot.get_link("gripper_link")
             g_quat = gripper_link.get_quat().cpu().numpy()
             rot = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
             
-            # アゴが伸びているローカル方向（-Z方向）をワールド座標の方向に変換
             jaw_dir_local = np.array([0.0, 0.0, -1.0])
             jaw_dir_world = rot.apply(jaw_dir_local)
             
-            # ワールド座標の「真下」ベクトル
             down_dir_world = np.array([0.0, 0.0, -1.0])
-            
-            # 内積（dot）を計算: 完全に下を向いていれば 1.0、水平なら 0.0
             dot = np.dot(jaw_dir_world, down_dir_world)
             
-            # 1.0（真下）からズレている分だけペナルティを与える（係数0.1でマイルドに）
-            reward_orientation = -(1.0 - dot) * 0.1
+            # 【変更】姿勢を直すメリットを復活させるため、係数を0.1に戻す。オフセットは -0.05。
+            reward_orientation = -(1.0 - dot) * 0.1 - 0.05
 
         # --------------------------------------------------
-        # 2. グリッパー開度ペナルティ（滑らかなプレシェイプの誘導）
+        # 2. グリッパー開度ペナルティ（プレシェイプの遅延と最適化）
         # --------------------------------------------------
         reward_gripper = 0.0
         if not self.is_grasping:
             current_qpos = self.robot.get_dofs_position().cpu().numpy()
             gripper_angle = current_qpos[self.gripper_idx]
             
-            # 【重要】距離10cmで45度、距離1cm以下で0度になるように「比例」させる
-            # これにより、急激な指令を避け、近づくにつれて滑らかに手を閉じる動作を誘導する
-            ratio = np.clip((dist_to_sponge - 0.01) / 0.09, 0.0, 1.0)
+            # 【変更】閉じる動作の開始を 10cm から 2.5cm (0.025) に遅らせる。
+            # 分母を 0.09 から 0.015 (2.5cm - 1.0cmの差分) に変更。
+            # これにより、TD誤差を防ぐ連続性を保ちつつ、スポンジを包み込む直前まで手を開きっぱなしにする。
+            ratio = np.clip((dist_to_sponge - 0.01) / 0.015, 0.0, 1.0)
             target_angle = ratio * (45.0 * np.pi / 180.0)
             
             diff = abs(gripper_angle - target_angle)
-            # ペナルティを強めに設定し、指示通りに指を動かさないと容赦なく減点する
-            reward_gripper = -diff * 0.1
+            
+            reward_gripper = -diff * 0.1 - 0.05
 
         # --------------------------------------------------
-        # 3. 持ち上げ姿勢のペナルティ（生存ボーナスの廃止）
+        # 3. 持ち上げ姿勢のペナルティ（1/10スケール）
         # --------------------------------------------------
         reward_lift = 0.0
         if self.is_grasping:
-            # 毎ステップの加点（ハッキングの温床）を完全に廃止。
-            # 代わりに、コップを横からなぎ倒さないよう、高さ(Z)が10cm未満の場合に減点を与える
             if s_pos[2] < 0.10:
-                reward_lift = -abs(0.10 - s_pos[2]) * 5.0
+                reward_lift = -abs(0.10 - s_pos[2]) * 0.5
 
         # --------------------------------------------------
-        # 4. 運搬ペナルティ
+        # 4. 運搬ペナルティ（1/10スケール）
         # --------------------------------------------------
         reward_move = 0.0
         if self.is_grasping:
-            # 把持中はコップへの距離を毎ステップ減点する。
-            # これにより「空中で待機」すると減点され続けるため、最短でコップへ向かうようになる
             dist_to_cup = float(np.linalg.norm(s_pos - c_pos))
-            reward_move = -dist_to_cup * 2.0
+            reward_move = -dist_to_cup * 0.2
+
+        # --------------------------------------------------
+        # 4.5. 関節速度ペナルティ（グリッパーの除外）
+        # --------------------------------------------------
+        qvel = self.robot.get_dofs_velocity().cpu().numpy()
+        
+        # 【変更】全関節からグリッパーのインデックスを削除し、アーム関節のみを抽出
+        arm_qvel = np.delete(qvel, self.gripper_idx)
+        
+        # グリッパーの速度は減点対象外とし、アームの無駄な振動のみを抑える
+        reward_vel = -float(np.sum(np.square(arm_qvel))) * 0.005
 
         # --------------------------------------------------
         # 5. 成功報酬（終端報酬）
         # --------------------------------------------------
-        # コップに入れた瞬間だけ巨大な報酬を与える
         reward_success = 50.0 if self._is_success else 0.0
 
-        total_reward = float(reward_reach + reward_gripper + reward_lift + reward_move + reward_success)
+        # 加算漏れを修正
+        total_reward = float(reward_reach + reward_orientation + reward_gripper + reward_lift + reward_move + reward_success + reward_vel)
 
         info = {
             "reward_reach": reward_reach,
@@ -377,6 +380,7 @@ class SO101GraspEnv(gym.Env):
             "reward_lift": reward_lift,
             "reward_move": reward_move,
             "reward_success": reward_success,
+            "reward_vel": reward_vel,
             "is_success": self._is_success
         }
         
@@ -675,7 +679,7 @@ class CustomMLP(BaseFeaturesExtractor):
 # ============================================================
 # 学習済みモデルを保存するディレクトリを作成し、PPOで学習を実行する関数
 def train():
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl25")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl34")
     LOG_DIR  = os.path.join(SAVE_DIR, "logs")
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(LOG_DIR,  exist_ok=True)
@@ -1613,7 +1617,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl25")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl34")
 
     # --------------------------------------------------
     # 引数なし → キーボードテレオペで環境確認
