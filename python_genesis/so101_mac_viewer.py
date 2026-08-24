@@ -109,7 +109,8 @@ class SO101GraspEnv(gym.Env):
         self._is_success = False
 
         try:
-            gs.init(backend=gs.cpu, logging_level="warning")
+            # gs.init(backend=gs.cpu, logging_level="warning")
+            gs.init(backend=gs.cuda, logging_level="warning")
         except Exception:
             pass
 
@@ -288,19 +289,18 @@ class SO101GraspEnv(gym.Env):
         dist_to_sponge = float(np.linalg.norm(jaw_pos - s_pos))
 
         # --------------------------------------------------
-        # 1. 接近ペナルティ（係数を元に戻し、動くメリットを復活させる）
+        # 1. 接近ペナルティ（把持前は常に重い時間税を課す）
         # --------------------------------------------------
         reward_reach = 0.0
         if not self.is_grasping:
             dx = jaw_pos[0] - s_pos[0]
             dy = jaw_pos[1] - s_pos[1]
             dz = jaw_pos[2] - s_pos[2]
-            
             xy_dist = float(np.sqrt(dx**2 + dy**2))
             z_dist = float(abs(dz))
             
-            # 【変更】距離を詰めるメリットを明確にするため、係数を(3.0, 1.5)に戻す。オフセットは -0.15。
-            reward_reach = -(xy_dist * 3.0 + z_dist * 1.5) - 0.15
+            # 【絶対ルール1】把持前は最低でも毎ステップ -1.2 の赤字
+            reward_reach = -(xy_dist * 2.0 + z_dist * 1.0) - 1.2
 
         # --------------------------------------------------
         # 1.5. 姿勢ペナルティ
@@ -310,68 +310,68 @@ class SO101GraspEnv(gym.Env):
             gripper_link = self.robot.get_link("gripper_link")
             g_quat = gripper_link.get_quat().cpu().numpy()
             rot = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
-            
             jaw_dir_local = np.array([0.0, 0.0, -1.0])
             jaw_dir_world = rot.apply(jaw_dir_local)
-            
             down_dir_world = np.array([0.0, 0.0, -1.0])
             dot = np.dot(jaw_dir_world, down_dir_world)
-            
-            # 【変更】姿勢を直すメリットを復活させるため、係数を0.1に戻す。オフセットは -0.05。
-            reward_orientation = -(1.0 - dot) * 0.1 - 0.05
+            reward_orientation = -(1.0 - dot) * 0.2
 
         # --------------------------------------------------
-        # 2. グリッパー開度ペナルティ（プレシェイプの遅延と最適化）
+        # 2. グリッパー開度ペナルティ（体当たりハッキングの防止）
         # --------------------------------------------------
         reward_gripper = 0.0
         if not self.is_grasping:
             current_qpos = self.robot.get_dofs_position().cpu().numpy()
             gripper_angle = current_qpos[self.gripper_idx]
+            dx = jaw_pos[0] - s_pos[0]
+            dy = jaw_pos[1] - s_pos[1]
+            xy_dist = float(np.sqrt(dx**2 + dy**2))
             
-            # 【変更】閉じる動作の開始を 10cm から 2.5cm (0.025) に遅らせる。
-            # 分母を 0.09 から 0.015 (2.5cm - 1.0cmの差分) に変更。
-            # これにより、TD誤差を防ぐ連続性を保ちつつ、スポンジを包み込む直前まで手を開きっぱなしにする。
-            ratio = np.clip((dist_to_sponge - 0.01) / 0.015, 0.0, 1.0)
-            target_angle = ratio * (45.0 * np.pi / 180.0)
-            
-            diff = abs(gripper_angle - target_angle)
-            
-            reward_gripper = -diff * 0.1 - 0.05
+            # 【絶対ルール2】指示通りに手を開かないと、極めて重い罰則(-0.785)を与える。
+            # 係数を 0.1 から 1.0 に引き上げ、閉じたまま近づくズルを割に合わなくする。
+            if xy_dist > 0.015:
+                target_angle = 45.0 * np.pi / 180.0
+                diff = abs(gripper_angle - target_angle)
+                reward_gripper = -diff * 1.0
+            elif xy_dist <= 0.015 and dist_to_sponge <= 0.025:
+                target_angle = 0.0
+                diff = abs(gripper_angle - target_angle)
+                reward_gripper = -diff * 1.0
+            else:
+                reward_gripper = 0.0
 
         # --------------------------------------------------
-        # 3. 持ち上げ姿勢のペナルティ（1/10スケール）
+        # 3. 持ち上げ姿勢のペナルティ（フリーズ稼ぎの防止）
         # --------------------------------------------------
         reward_lift = 0.0
         if self.is_grasping:
-            if s_pos[2] < 0.10:
-                reward_lift = -abs(0.10 - s_pos[2]) * 0.5
+            # ボーナスを廃止し、「10cmに満たない分だけ減点」に戻す（最大 -0.2）
+            reward_lift = -max(0.0, 0.10 - s_pos[2]) * 2.0
 
         # --------------------------------------------------
-        # 4. 運搬ペナルティ（1/10スケール）
+        # 4. 運搬ペナルティ（タスク完了への強制）
         # --------------------------------------------------
         reward_move = 0.0
         if self.is_grasping:
             dist_to_cup = float(np.linalg.norm(s_pos - c_pos))
-            reward_move = -dist_to_cup * 0.2
+            # 【絶対ルール3】把持後も「毎ステップ -0.2」の赤字を垂れ流し続ける。
+            # フリーズ稼ぎは不可能。赤字を止める唯一の方法は、コップに到達して成功報酬を得ること。
+            reward_move = -(dist_to_cup * 1.0) - 0.2
 
         # --------------------------------------------------
-        # 4.5. 関節速度ペナルティ（グリッパーの除外）
+        # 4.5. 関節速度ペナルティ
         # --------------------------------------------------
         qvel = self.robot.get_dofs_velocity().cpu().numpy()
-        
-        # 【変更】全関節からグリッパーのインデックスを削除し、アーム関節のみを抽出
         arm_qvel = np.delete(qvel, self.gripper_idx)
-        
-        # グリッパーの速度は減点対象外とし、アームの無駄な振動のみを抑える
         reward_vel = -float(np.sum(np.square(arm_qvel))) * 0.005
 
         # --------------------------------------------------
-        # 5. 成功報酬（終端報酬）
+        # 5. 成功報酬
         # --------------------------------------------------
-        reward_success = 50.0 if self._is_success else 0.0
+        # マイナスの合計値に合わせて設定
+        reward_success = 100.0 if self._is_success else 0.0
 
-        # 加算漏れを修正
-        total_reward = float(reward_reach + reward_orientation + reward_gripper + reward_lift + reward_move + reward_success + reward_vel)
+        total_reward = float(reward_reach + reward_orientation + reward_gripper + reward_lift + reward_move + reward_vel + reward_success)
 
         info = {
             "reward_reach": reward_reach,
@@ -379,8 +379,8 @@ class SO101GraspEnv(gym.Env):
             "reward_gripper": reward_gripper,
             "reward_lift": reward_lift,
             "reward_move": reward_move,
-            "reward_success": reward_success,
             "reward_vel": reward_vel,
+            "reward_success": reward_success,
             "is_success": self._is_success
         }
         
@@ -477,9 +477,17 @@ class SO101GraspEnv(gym.Env):
         s_quat = self.sponge.get_quat().cpu().numpy()
         jaw_pos = self._get_jaw_pos()
 
-        # [新規追加] テレオペ環境から移植した仮想拘束（把持）のロジック群 ----------
-        dist = float(np.linalg.norm(jaw_pos - s_pos))
-        is_close = dist < 0.01
+# [新規追加] テレオペ環境から移植した仮想拘束（把持）のロジック群 ----------
+        dx = jaw_pos[0] - s_pos[0]
+        dy = jaw_pos[1] - s_pos[1]
+        dz = jaw_pos[2] - s_pos[2]
+        xy_dist = float(np.sqrt(dx**2 + dy**2))
+        z_dist = float(abs(dz))
+        
+        # 【変更】球状判定から、円柱状判定（XYのズレとZの高さを独立して評価）に変更
+        # スポンジの幅にすっぽり収まるXY精度(1.5cm以内)を要求する
+        is_close = (xy_dist <= 0.015) and (z_dist <= 0.025)
+        
         g_angle = target_qpos[self.gripper_idx]
         is_squeezing = g_angle <= 0.20
 
@@ -560,7 +568,8 @@ class SO101ViewerEnv:
 
     def __init__(self):
         try:
-            gs.init(backend=gs.cpu, logging_level="info")
+            # gs.init(backend=gs.cpu, logging_level="info")
+            gs.init(backend=gs.cuda, logging_level="warning")
         except Exception:
             pass
 
@@ -679,12 +688,12 @@ class CustomMLP(BaseFeaturesExtractor):
 # ============================================================
 # 学習済みモデルを保存するディレクトリを作成し、PPOで学習を実行する関数
 def train():
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl34")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl38")
     LOG_DIR  = os.path.join(SAVE_DIR, "logs")
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(LOG_DIR,  exist_ok=True)
 
-    N_ENVS = 4   # Mac CPUに合わせて並列数を削減（Colabの64→4）
+    N_ENVS = 16   # Mac CPUに合わせて並列数を削減（Colabの64→4）
     print(f"\n並列環境数: {N_ENVS}  保存先: {SAVE_DIR}\n")
 
     def make_env(env_id):
@@ -715,6 +724,7 @@ def train():
     if os.path.exists(checkpoint_path):
         try:
             model = PPO.load(checkpoint_path, env=envs, device="cpu")
+            # model = PPO.load(checkpoint_path, env=envs, device="cuda")
             print(f"✓ チェックポイントをロード: {checkpoint_path}")
         except ValueError as e:
             print(f"⚠️ 観測空間不一致のため新規学習: {e}")
@@ -730,7 +740,7 @@ def train():
         eval_freq=20_000, n_eval_episodes=10, deterministic=True, render=False,
     )
 
-    TOTAL_TIMESTEPS = 200_000
+    TOTAL_TIMESTEPS = 500_000
     print(f"学習開始: {TOTAL_TIMESTEPS:,} ステップ\n")
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
@@ -780,7 +790,8 @@ def run_keyboard_teleop():
     from matplotlib.path import Path  # 視野ポリゴンの判定に使用
 
     try:
-        gs.init(backend=gs.cpu, logging_level="info")
+        # gs.init(backend=gs.cpu, logging_level="info")
+        gs.init(backend=gs.cuda, logging_level="warning")
     except Exception:
         pass
 
@@ -1617,7 +1628,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl34")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl38")
 
     # --------------------------------------------------
     # 引数なし → キーボードテレオペで環境確認
