@@ -4,136 +4,93 @@
 # ============================================================
 
 # ============================================================
-# STEP 0: 依存ライブラリのインストール（初回のみ）
-# ============================================================
-# pip install genesis-world stable-baselines3 gymnasium opencv-python
-
-
-# so101_URDF みたいなフォルダが自動で作られ、URDFとSTLがダウンロードされる．
-
-# ============================================================
-# STEP 1: インポート
+# Genesis SO-101アーム - 強化学習（PPO） GPU並列・爆速版
 # ============================================================
 import genesis as gs
 import numpy as np
-# import json
 import yaml
 import torch
 import torch.nn as nn
 import os
 import re
 import urllib.request
-import matplotlib
 import time
-from scipy.spatial.transform import Rotation as R 
-matplotlib.use("Agg")   # ビューワーと競合しないバックエンド
-import matplotlib.pyplot as plt
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv,DummyVecEnv, VecMonitor
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import gymnasium as gym
-from gymnasium import spaces
+from scipy.spatial.transform import Rotation as R 
 
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.agents.torch.ppo import PPO, PPO_CFG
+from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
+from skrl.memories.torch import RandomMemory
+import skrl.envs.wrappers.torch as skrl_wrappers
 
 # ============================================================
-# STEP 2: SO-101 URDFをダウンロード（初回のみ）
+# STEP 1: 設定とURDFダウンロード
 # ============================================================
-# URDF_DIR  = os.path.join(os.path.dirname(__file__), "so101_urdf")
-# URDF_PATH = os.path.join(URDF_DIR, '/home/hogehoge/Genesis/examples/robots/so101/so101_new.urdf')
 URDF_PATH = '/home/hogehoge/Genesis/examples/robots/so101/so101_new.urdf'
-def download_so101():
-    os.makedirs(URDF_DIR, exist_ok=True)
-    os.makedirs(os.path.join(URDF_DIR, "assets"), exist_ok=True)
-    urdf_url = "https://huggingface.co/haixuantao/dora-bambot/resolve/main/URDF/so101.urdf"
-    print("SO-101 URDFをダウンロード中...")
-    urllib.request.urlretrieve(urdf_url, URDF_PATH)
-    print("✓ URDF ダウンロード完了")
-    with open(URDF_PATH, "r") as f:
-        content = f.read()
-    stl_files = set(
-        os.path.basename(m)
-        for m in re.findall(r'filename="([^"]+\.stl)"', content, re.IGNORECASE)
-    )
-    base_url = "https://huggingface.co/haixuantao/dora-bambot/resolve/main/URDF/assets/"
-    for stl in stl_files:
-        dest = os.path.join(URDF_DIR, "assets", stl)
-        if not os.path.exists(dest):
-            try:
-                urllib.request.urlretrieve(base_url + stl, dest)
-                print(f"  ✓ {stl}")
-            except Exception as e:
-                print(f"  ✗ {stl}: {e}")
 
-if not os.path.exists(URDF_PATH):
-    # download_so101()
-    pass
-else:
-    print("✓ URDFはすでに存在します")
+# 並列数をここで一元管理（VRAM 8GBなら16〜32が目安。まずは16で確実な爆速を体感してください）
+N_ENVS = 16
 
 # ============================================================
-# STEP 3: 学習用環境クラス（show_viewer=False、高速化優先）
+# STEP 2: GPUネイティブ環境クラス（Genesisバッチ処理対応版）
 # ============================================================
-CAM_W, CAM_H = 320, 240   # 学習時は小さめで省メモリ
-
-# 主にこのクラスを書き換えて環境をカスタマイズ．
-class SO101GraspEnv(gym.Env):
+class SO101GraspEnvBatched:
     """
-    SO-101ロボットアームがキューブを把持して持ち上げるRL環境
-    学習用（show_viewer=False）
+    Genesisのバッチ機能（B_envs）を活用し、GPU上で全環境を並列計算するクラス。
+    NumPyへの変換を排除し、すべてPyTorchテンソルで処理します。
     """
-    metadata = {"render_modes": ["rgb_array"]}
+    MAX_STEPS = 500
+    ACTION_SCALE = 0.05
+    DT = 0.01
 
-    N_CUBES          = 5
-    MAX_STEPS        = 500
-    CUBE_LIFT_HEIGHT = 0.07
-    ACTION_SCALE     = 0.05
-    DT               = 0.01
-
-    # CUBE_X_MIN, CUBE_X_MAX = 0.05, 0.18
-    # CUBE_Y_MIN, CUBE_Y_MAX = -0.25, -0.02
-
-    # 入出力のサイズ定義
-    def __init__(self, render_mode=None, env_id=0, show_viewer=False):
-        super().__init__()
-        self.render_mode = render_mode
-        self.env_id      = env_id
-        self._step_count = 0
+    def __init__(self, num_envs=N_ENVS, show_viewer=False):
+        self.num_envs = num_envs
         self.show_viewer = show_viewer
+        
+        # skrlが要求するデバイス
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        
+        # バッチ管理用のフラグとカウンター (すべてテンソル)
+        self.step_counts = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.is_grasping = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.success_frame_counts = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self._is_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # --- 追加: 状態管理変数の初期化 ---
-        self.is_grasping = False
-        self.relative_rot = None
-        self.relative_pos = None
-        self.success_frame_count = 0
-        self._is_success = False
-
+        # 把持した瞬間の相対位置・姿勢（バッチサイズ分保持）
+        self.relative_pos = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        
         try:
-            # gs.init(backend=gs.cpu, logging_level="warning")
             gs.init(backend=gs.cuda, logging_level="warning")
         except Exception:
             pass
 
-        # 設定のロードとシーン構築
         self._load_config()
         self._build_scene()
 
-        # --- 変更: 観測空間の次元数を再定義 ---
-        # qpos(6) + qvel(6) + アゴ先pos(3) + スポンジpos(3) + スポンジquat(4) + コップpos(3) + 把持フラグ(1) = 26次元
         self.n_dofs = self.robot.n_dofs
         obs_dim = 2 * self.n_dofs + 14 
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32) # AIが受け取る情報の形と範囲を定義
-        self.action_space      = spaces.Box(-1.0, 1.0, shape=(self.n_dofs,), dtype=np.float32) # AIが出力できる行動の範囲を定義(-1.0 〜 1.0 の連続値)
+        
+        # skrl用の空間定義
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.n_dofs,), dtype=np.float32)
+        
+        # skrlが直接要求するプロパティ群
+        self.state_space = self.observation_space
+        self.shared_observation_space = None
+        self.unwrapped = self
+        
+        # 毎ステップ使い回すバッファ
+        self.obs_buf = torch.zeros((self.num_envs, obs_dim), dtype=torch.float32, device=self.device)
+        self.reward_buf = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.terminated_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.truncated_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-    # [新規追加] テストコードで作成した設定読み込みロジックを移植
     def _load_config(self):
-        """YAMLから設定を読み込み、出現可能エリアのポリゴンを計算する"""
-        import os
         import yaml
         from matplotlib.path import Path
-
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        parent_dir = os.path.dirname(script_dir) # my_so101 フォルダ
+        parent_dir = os.path.dirname(script_dir)
         config_path = os.path.join(parent_dir, "config", "env_config.yaml")
         self.cup_urdf_path = os.path.join(parent_dir, "assets", "papercup.urdf")
 
@@ -153,16 +110,12 @@ class SO101GraspEnv(gym.Env):
         self.arm_reach_max = env_data.get("arm_reach_max", 0.30)
         self.arm_yaw_min   = np.deg2rad(env_data.get("arm_yaw_min_deg", -90.0))
         self.arm_yaw_max   = np.deg2rad(env_data.get("arm_yaw_max_deg", 90.0))
-        
-        # ロボットの原点と肩のオフセット（テレオペ環境から）
         self.shoulder_x = 0.04 + 0.0388
         self.shoulder_y = 0.04 + 0.0
-        
-        # 死角エリア
         self.deadzone_x_min, self.deadzone_x_max = 0.0, 0.25
         self.deadzone_y_min, self.deadzone_y_max = 0.0, 0.15
 
-        # カメラ視野ポリゴンの計算
+        # カメラ視野ポリゴンの計算 (CPU側で行う初期化処理なのでNumPyのままでOK)
         cam_x, cam_y, cam_z = cam_cfg["x"], cam_cfg["y"], cam_cfg["z"]
         pitch = np.deg2rad(cam_cfg["pitch_deg"])
         cam_dir   = np.array([np.cos(pitch), 0, np.sin(pitch)])
@@ -171,23 +124,16 @@ class SO101GraspEnv(gym.Env):
 
         w = np.tan(np.deg2rad(cam_cfg["fov_h_deg"]) / 2)
         h = np.tan(np.deg2rad(cam_cfg["fov_v_deg"]) / 2)
-
         rays = np.array([
-            cam_dir + w * cam_right + h * cam_up,
-            cam_dir - w * cam_right + h * cam_up,
-            cam_dir - w * cam_right - h * cam_up,
-            cam_dir + w * cam_right - h * cam_up
+            cam_dir + w * cam_right + h * cam_up, cam_dir - w * cam_right + h * cam_up,
+            cam_dir - w * cam_right - h * cam_up, cam_dir + w * cam_right - h * cam_up
         ])
-
         t = (self.mat_z - cam_z) / rays[:, 2]
         intersect_pts = np.array([cam_x, cam_y, cam_z]) + t[:, np.newaxis] * rays
         self.fov_poly = Path(intersect_pts[:, :2])
+        self.home_qpos = torch.tensor(env_data.get("home_qpos", [0.0]*6), dtype=torch.float32, device=self.device)
 
-        self.home_qpos = np.array(env_data.get("home_qpos", [0.0]*6), dtype=np.float32)
-
-    # [新規追加] テストコードで作成した配置判定ロジックを移植
     def _is_valid_spawn_area(self, x, y):
-        """座標(x, y)が出現条件を満たしているか判定する"""
         if not (self.mat_x_start <= x <= (self.mat_x_start + self.mat_length)): return False
         if not (self.mat_y_start <= y <= (self.mat_y_start + self.mat_width)):  return False
         if not self.fov_poly.contains_point((x, y)): return False
@@ -201,567 +147,390 @@ class SO101GraspEnv(gym.Env):
         if not (self.arm_yaw_min <= theta <= self.arm_yaw_max): return False
         if (self.deadzone_x_min <= x <= self.deadzone_x_max) and (self.deadzone_y_min <= y <= self.deadzone_y_max):
             return False
-            
         return True
 
-    # 環境の初期化（シーン構築）
     def _build_scene(self):
+        # 【超重要】Sceneに B (バッチサイズ) を渡すことで、GenesisがGPU上でnum_envs個の世界を同時生成する
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.DT, substeps=5),
-            show_viewer=self.show_viewer,   # 学習中はビューワー非表示
             viewer_options=gs.options.ViewerOptions(
-                camera_pos=(0.8, -0.8, 0.6),
-                camera_lookat=(0.15, 0.0, 0.1),
-            ) if self.show_viewer else None # ← ビューワーON時のみカメラ設定を渡す
+                camera_pos=(0.8, -0.8, 0.6), camera_lookat=(0.15, 0.0, 0.1),
+            ) if self.show_viewer else None,
+            show_viewer=self.show_viewer
         )
         self.scene.add_entity(gs.morphs.Plane())
 
-        # URDF読み込み
-        try:
-            self.robot = self.scene.add_entity(
-                gs.morphs.URDF(file=URDF_PATH, pos=(0, 0, 0), fixed=True)
-            )
-        except Exception as e:
-            print(f"URDF読み込みエラー ({e})、Pandaで代替")
-            self.robot = self.scene.add_entity(
-                gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml")
-            )
-
-        # --- 変更: キューブ5個を削除し、スポンジと紙コップを追加 ---
+        # ロボット
+        self.robot = self.scene.add_entity(
+            gs.morphs.URDF(file=URDF_PATH, pos=(0, 0, 0), fixed=True)
+        )
+        # スポンジ
         self.sponge = self.scene.add_entity(
             material=gs.materials.Rigid(rho=500, friction=5.0, coup_friction=5.0),
             morph=gs.morphs.Box(size=(0.04, 0.03, 0.03), pos=(0.1, 0, 0.1), fixed=False),
-            surface=gs.surfaces.Default(color=(0.6, 1.0, 0.0, 1.0)) # 黄緑色
+            surface=gs.surfaces.Default(color=(0.6, 1.0, 0.0, 1.0))
         )
-        
+        # コップ
         self.cup = self.scene.add_entity(
             material=gs.materials.Rigid(rho=500, friction=2.0, coup_friction=3.0),
             morph=gs.morphs.URDF(file=self.cup_urdf_path, pos=(0.1, 0.1, 0.1), fixed=False)
         )
 
+        # GPU上でnum_envs個の世界を一斉にビルド
+        self.scene.build(n_envs=self.num_envs)
 
-        self.scene.build()
-        self.n_dofs = self.robot.n_dofs
-
-        # --- 追加: グリッパーの関節インデックスを取得 ---
         try:
             self.gripper_idx = self.robot.get_joint("gripper").dof_idx_local
         except Exception:
             self.gripper_idx = 5
-
-    # AIへの入力情報を取得する関数
-    def _get_eef_pos(self) -> np.ndarray:
-        try:
-            return self.robot.get_link("moving_jaw_so101_v1").get_pos().cpu().numpy()
-        except Exception:
-            return np.array([0.10, -0.15, 0.28], dtype=np.float32)
-
-    
-    def _get_cube_positions(self) -> np.ndarray:
-        return np.stack([c.get_pos().cpu().numpy() for c in self.cubes])
-    
-
-    # AIへの入力情報をまとめる関数
-    def _get_obs(self) -> np.ndarray:
-        # ロボットの関節角度と速度
-        qpos      = self.robot.get_dofs_position().cpu().numpy()
-        qvel      = self.robot.get_dofs_velocity().cpu().numpy()
-
-        # --- 変更: 各オブジェクトの正確な状態を取得 ---
-        # ※ _get_jaw_pos() は手先の回転を考慮してアゴ先端を計算する自作関数とします
-        eef_pos = self._get_jaw_pos() 
-        s_pos = self.sponge.get_pos().cpu().numpy()
-        s_quat = self.sponge.get_quat().cpu().numpy()
-        c_pos = self.cup.get_pos().cpu().numpy()
-
-        # 把持しているかどうかのフラグを数値(0.0 または 1.0)として追加
-        grasp_flag = np.array([1.0 if self.is_grasping else 0.0], dtype=np.float32)
-
-        # 取得した全要素を1つの1次元配列に結合（要素数は必ず obs_dim と一致させる）
-        obs = np.concatenate([qpos, qvel, eef_pos, s_pos, s_quat, c_pos, grasp_flag])
-        return obs.astype(np.float32)
-    
-    # 報酬関数
-    def _compute_reward(self):
-        jaw_pos = self._get_jaw_pos()
-        s_pos = self.sponge.get_pos().cpu().numpy()
-        c_pos = self.cup.get_pos().cpu().numpy()
-        dist_to_sponge = float(np.linalg.norm(jaw_pos - s_pos))
-
-        # --------------------------------------------------
-        # 1. 接近ペナルティ（把持前は常に重い時間税を課す）
-        # --------------------------------------------------
-        reward_reach = 0.0
-        if not self.is_grasping:
-            dx = jaw_pos[0] - s_pos[0]
-            dy = jaw_pos[1] - s_pos[1]
-            dz = jaw_pos[2] - s_pos[2]
-            xy_dist = float(np.sqrt(dx**2 + dy**2))
-            z_dist = float(abs(dz))
             
-            # 【絶対ルール1】把持前は最低でも毎ステップ -1.2 の赤字
-            reward_reach = -(xy_dist * 2.0 + z_dist * 1.0) - 1.2
+        # Z方向のダウンベクトル (計算用に常に用意しておく)
+        self.down_dir_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).repeat(self.num_envs, 1)
 
-        # --------------------------------------------------
-        # 1.5. 姿勢ペナルティ
-        # --------------------------------------------------
-        reward_orientation = 0.0
-        if not self.is_grasping:
-            gripper_link = self.robot.get_link("gripper_link")
-            g_quat = gripper_link.get_quat().cpu().numpy()
-            rot = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
-            jaw_dir_local = np.array([0.0, 0.0, -1.0])
-            jaw_dir_world = rot.apply(jaw_dir_local)
-            down_dir_world = np.array([0.0, 0.0, -1.0])
-            dot = np.dot(jaw_dir_world, down_dir_world)
-            reward_orientation = -(1.0 - dot) * 0.2
+    def _get_jaw_pos_batched(self):
+        # テンソルのまま (N_ENVS, 3) と (N_ENVS, 4) を取得
+        g_pos = self.robot.get_link("gripper_link").get_pos()
+        g_quat = self.robot.get_link("gripper_link").get_quat()
+        
+        # PyTorch版のクォータニオン回転関数 (簡易実装: ベクトルをZ軸方向に回す)
+        # クォータニオン q = [w, x, y, z] を想定
+        w, x, y, z = g_quat[:, 0], g_quat[:, 1], g_quat[:, 2], g_quat[:, 3]
+        
+        # jaw_offset_local = [0.01, 0.0, -0.09] を回転させる
+        offset_x, offset_y, offset_z = 0.01, 0.0, -0.09
+        
+        rot_x = (1 - 2*y**2 - 2*z**2)*offset_x + (2*x*y - 2*w*z)*offset_y + (2*x*z + 2*w*y)*offset_z
+        rot_y = (2*x*y + 2*w*z)*offset_x + (1 - 2*x**2 - 2*z**2)*offset_y + (2*y*z - 2*w*x)*offset_z
+        rot_z = (2*x*z - 2*w*y)*offset_x + (2*y*z + 2*w*x)*offset_y + (1 - 2*x**2 - 2*y**2)*offset_z
+        
+        jaw_rot = torch.stack([rot_x, rot_y, rot_z], dim=1)
+        return g_pos + jaw_rot
 
-        # --------------------------------------------------
-        # 2. グリッパー開度ペナルティ（体当たりハッキングの防止）
-        # --------------------------------------------------
-        reward_gripper = 0.0
-        if not self.is_grasping:
-            current_qpos = self.robot.get_dofs_position().cpu().numpy()
-            gripper_angle = current_qpos[self.gripper_idx]
-            dx = jaw_pos[0] - s_pos[0]
-            dy = jaw_pos[1] - s_pos[1]
-            dz = jaw_pos[2] - s_pos[2]
-            xy_dist = float(np.sqrt(dx**2 + dy**2))
-            z_dist = float(abs(dz))
-            
-            # 【調整1】Z軸(高さ)の条件を追加し、上空では閉じるのを要求しない
-            # 把持判定(z_dist <= 0.025)より少し上の 0.035m を境界にする
-            is_in_grasp_zone = (xy_dist <= 0.015) and (z_dist <= 0.035)
-            
-            # 【調整2】位置合わせを最優先させるため、ペナルティ係数を極小化（0.01）
-            if not is_in_grasp_zone:
-                # 把持ゾーンの外：手を開いておく
-                target_angle = 30.0 * np.pi / 180.0
-                diff = abs(gripper_angle - target_angle)
-                reward_gripper = -diff * 0.5
-            else:
-                # 把持ゾーンの中：手を閉じる（位置が合えばゆっくり閉じる）
-                target_angle = 0.0
-                diff = abs(gripper_angle - target_angle)
-                reward_gripper = -diff * 0.05
+    def _get_obs(self):
+        qpos = self.robot.get_dofs_position()
+        qvel = self.robot.get_dofs_velocity()
+        jaw_pos = self._get_jaw_pos_batched()
+        s_pos = self.sponge.get_pos()
+        s_quat = self.sponge.get_quat()
+        c_pos = self.cup.get_pos()
+        
+        grasp_flag = self.is_grasping.to(torch.float32).unsqueeze(1)
+        
+        # (N_ENVS, obs_dim) に沿って結合
+        self.obs_buf = torch.cat([qpos, qvel, jaw_pos, s_pos, s_quat, c_pos, grasp_flag], dim=1)
+        return self.obs_buf
 
-        # --------------------------------------------------
-        # 3. 持ち上げ姿勢のペナルティ（フリーズ稼ぎの防止）
-        # --------------------------------------------------
-        reward_lift = 0.0
-        if self.is_grasping:
-            # ボーナスを廃止し、「10cmに満たない分だけ減点」に戻す（最大 -0.2）
-            reward_lift = -max(0.0, 0.10 - s_pos[2]) * 2.0
+    def _compute_reward(self, current_qpos):
+        jaw_pos = self._get_jaw_pos_batched()
+        s_pos = self.sponge.get_pos()
+        c_pos = self.cup.get_pos()
+        
+        dx = jaw_pos[:, 0] - s_pos[:, 0]
+        dy = jaw_pos[:, 1] - s_pos[:, 1]
+        dz = jaw_pos[:, 2] - s_pos[:, 2]
+        
+        xy_dist = torch.sqrt(dx**2 + dy**2)
+        z_dist = torch.abs(dz)
+        dist_to_sponge = torch.sqrt(dx**2 + dy**2 + dz**2)
+        
+        reward = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        
+        # --- ペナルティ計算 (全環境を一括でTorchテンソル演算) ---
+        not_grasping = ~self.is_grasping
+        
+        # 1. 接近ペナルティ
+        reward[not_grasping] += -(xy_dist[not_grasping] * 2.0 + z_dist[not_grasping] * 1.0) - 1.2
+        
+        # 2. グリッパー開度ペナルティ
+        gripper_angle = current_qpos[:, self.gripper_idx]
+        
+        far_mask = not_grasping & (xy_dist > 0.015)
+        target_angle_far = 45.0 * np.pi / 180.0
+        reward[far_mask] += -torch.abs(gripper_angle[far_mask] - target_angle_far) * 1.0
+        
+        close_mask = not_grasping & (xy_dist <= 0.015) & (dist_to_sponge <= 0.025)
+        target_angle_close = 0.0
+        reward[close_mask] += -torch.abs(gripper_angle[close_mask] - target_angle_close) * 1.0
 
-        # --------------------------------------------------
-        # 4. 運搬ペナルティ（タスク完了への強制）
-        # --------------------------------------------------
-        reward_move = 0.0
-        if self.is_grasping:
-            dist_to_cup = float(np.linalg.norm(s_pos - c_pos))
-            # 【絶対ルール3】把持後も「毎ステップ -0.2」の赤字を垂れ流し続ける。
-            # フリーズ稼ぎは不可能。赤字を止める唯一の方法は、コップに到達して成功報酬を得ること。
-            reward_move = -(dist_to_cup * 1.0) - 0.2
+        # 3. 持ち上げ & 4. 運搬ペナルティ
+        grasping = self.is_grasping
+        lift_penalty = torch.clamp(0.10 - s_pos[:, 2], min=0.0) * 2.0
+        reward[grasping] += -lift_penalty[grasping]
+        
+        dist_to_cup = torch.sqrt(torch.sum((s_pos - c_pos)**2, dim=1))
+        reward[grasping] += -(dist_to_cup[grasping] * 1.0) - 0.2
 
-        # --------------------------------------------------
-        # 4.5. 関節速度ペナルティ
-        # --------------------------------------------------
-        qvel = self.robot.get_dofs_velocity().cpu().numpy()
-        arm_qvel = np.delete(qvel, self.gripper_idx)
-        reward_vel = -float(np.sum(np.square(arm_qvel))) * 0.005
+        # 4.5 速度ペナルティ
+        qvel = self.robot.get_dofs_velocity()
+        # グリッパー以外の速度の2乗和
+        arm_qvel_sq = torch.sum(qvel**2, dim=1) - qvel[:, self.gripper_idx]**2
+        reward += -arm_qvel_sq * 0.005
 
-        # --------------------------------------------------
         # 5. 成功報酬
-        # --------------------------------------------------
-        # マイナスの合計値に合わせて設定
-        reward_success = 100.0 if self._is_success else 0.0
-
-        total_reward = float(reward_reach + reward_orientation + reward_gripper + reward_lift + reward_move + reward_vel + reward_success)
-
-        info = {
-            "reward_reach": reward_reach,
-            "reward_orientation": reward_orientation,
-            "reward_gripper": reward_gripper,
-            "reward_lift": reward_lift,
-            "reward_move": reward_move,
-            "reward_vel": reward_vel,
-            "reward_success": reward_success,
-            "is_success": self._is_success
-        }
+        reward[self._is_success] += 100.0
         
-        return total_reward, info
-    
-    # [完全新規追加] テレオペ環境のロジックから移植
-    def _get_jaw_pos(self) -> np.ndarray:
-        """手先の回転を考慮したアゴ先端の正確な座標を取得"""
-        # [新規追加] グリッパーのリンク位置と姿勢を取得
-        gripper_link = self.robot.get_link("gripper_link")
-        g_pos = gripper_link.get_pos().cpu().numpy()
-        g_quat = gripper_link.get_quat().cpu().numpy()
-        
-        # [新規追加] クォータニオンから回転行列を生成
-        from scipy.spatial.transform import Rotation as R
-        rot = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
-        
-        # [新規追加] グリッパー基準座標からアゴ先端へのローカルオフセット（Z方向に-9cm）
-        jaw_offset_local = np.array([0.01, 0.0, -0.09], dtype=np.float32)
-        
-        # [新規追加] ローカルオフセットに回転を適用し、ワールド座標を算出
-        return g_pos + rot.apply(jaw_offset_local)
+        self.reward_buf = reward
+        return self.reward_buf
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        # self._step_count = 0
-        rng = np.random.default_rng(seed)
-
-        # --- ① 状態・カウンターの初期化（前エピソードの情報を消去） ---
-        self._step_count = 0
-        self.is_grasping = False
-        self.relative_rot = None
-        self.relative_pos = None
-        self.success_frame_count = 0
-        self._is_success = False
-
-        # --- ② ロボットの初期化 ---
-        self.robot.set_dofs_position(self.home_qpos)
-        self.robot.set_dofs_velocity(np.zeros(self.n_dofs, dtype=np.float32))
-
-        # --- ③ 対象物のランダム配置 ---
-        x_min, x_max = self.mat_x_start, self.mat_x_start + self.mat_length
-        y_min, y_max = self.mat_y_start, self.mat_y_start + self.mat_width
-
-        # 紙コップの配置
-        while True:
-            cup_x, cup_y = rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)
-            if self._is_valid_spawn_area(cup_x, cup_y): 
-                break
-        self.cup.set_pos(np.array([cup_x, cup_y, 0.015], dtype=np.float32))
-        self.cup.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
-
-        # スポンジの配置（コップから6cm以上離す）
-        while True:
-            sp_x, sp_y = rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)
-            if not self._is_valid_spawn_area(sp_x, sp_y): 
-                continue
-            if np.sqrt((sp_x - cup_x)**2 + (sp_y - cup_y)**2) >= 0.06: 
-                break
-        self.sponge.set_pos(np.array([sp_x, sp_y, 0.02], dtype=np.float32))
-        self.sponge.set_quat(np.array([0.7071, 0.7071, 0.0, 0.0], dtype=np.float32))
-
-        for _ in range(10):
-            self.scene.step()
-
-        return self._get_obs(), {}
-    
-    # AIの行動を受け取り、環境を1ステップ進める関数
-    def step(self, action: np.ndarray):
-        self._step_count += 1
-
-
-        current_qpos = self.robot.get_dofs_position().cpu().numpy()
-        delta        = np.clip(action, -1.0, 1.0) * self.ACTION_SCALE
-        target_qpos  = np.clip(current_qpos + delta, -np.pi, np.pi)
-        # --------------------------------------------------
-        # [追加] グリッパーの可動域を強制クリップ（めり込み・過剰回転防止）
-        # --------------------------------------------------
-        GRIPPER_MIN = -0.174  # 完全に閉じた状態の限界値
-        GRIPPER_MAX = 1.745   # 完全に開いた状態の限界値
-        target_qpos[self.gripper_idx] = np.clip(
-            target_qpos[self.gripper_idx], 
-            GRIPPER_MIN, 
-            GRIPPER_MAX
-        )
-        self.robot.set_dofs_position(target_qpos.astype(np.float32))
-        self.scene.step()
-
-        # [新規追加] 対象物の現在座標と姿勢を取得（仮想拘束・内外判定用）
-        gripper_link = self.robot.get_link("gripper_link")
-        g_pos = gripper_link.get_pos().cpu().numpy()
-        g_quat = gripper_link.get_quat().cpu().numpy()
-        s_pos = self.sponge.get_pos().cpu().numpy()
-        s_quat = self.sponge.get_quat().cpu().numpy()
-        jaw_pos = self._get_jaw_pos()
-
-# [新規追加] テレオペ環境から移植した仮想拘束（把持）のロジック群 ----------
-        dx = jaw_pos[0] - s_pos[0]
-        dy = jaw_pos[1] - s_pos[1]
-        dz = jaw_pos[2] - s_pos[2]
-        xy_dist = float(np.sqrt(dx**2 + dy**2))
-        z_dist = float(abs(dz))
-        
-        # 【変更】球状判定から、円柱状判定（XYのズレとZの高さを独立して評価）に変更
-        # スポンジの幅にすっぽり収まるXY精度(1.5cm以内)を要求する
-        is_close = (xy_dist <= 0.015) and (z_dist <= 0.025)
-        
-        g_angle = target_qpos[self.gripper_idx]
-        is_squeezing = g_angle <= 0.20
-
-        if not self.is_grasping:
-            if is_close and is_squeezing:
-                self.is_grasping = True
-                rot_g = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
-                rot_s = R.from_quat([s_quat[1], s_quat[2], s_quat[3], s_quat[0]])
-                self.relative_rot = rot_g.inv() * rot_s
-                self.relative_pos = rot_g.inv().apply(s_pos - g_pos)
-        else:
-            if g_angle > 0.35:
-                self.is_grasping = False
-                self.relative_rot = None
-                self.relative_pos = None
-
-        if self.is_grasping:
-            rot_g_current = R.from_quat([g_quat[1], g_quat[2], g_quat[3], g_quat[0]])
-            self.sponge.set_pos(g_pos + rot_g_current.apply(self.relative_pos))
-            q_new = (rot_g_current * self.relative_rot).as_quat()
-            self.sponge.set_quat(np.array([q_new[3], q_new[0], q_new[1], q_new[2]], dtype=np.float32))
-
-        # ----------------------------------------------------------------------
-
-        # [新規追加] テレオペ環境から移植した紙コップの内外判定ロジック群 ----------
-        c_pos = self.cup.get_pos().cpu().numpy()
-        c_quat = self.cup.get_quat().cpu().numpy()
-        rot_c = R.from_quat([c_quat[1], c_quat[2], c_quat[3], c_quat[0]])
-        s_local_to_cup = rot_c.inv().apply(s_pos - c_pos)
-        
-        in_x = abs(s_local_to_cup[0]) < 0.035
-        in_y = abs(s_local_to_cup[1]) < 0.035
-        in_z = -0.015 < s_local_to_cup[2] < 0.060
-        is_in_cup = in_x and in_y and in_z and not self.is_grasping
-
-        if is_in_cup:
-            self.success_frame_count += 1
-        else:
-            self.success_frame_count = 0
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
             
-        if self.success_frame_count >= 50:
-            self._is_success = True
-        # ----------------------------------------------------------------------
+        n_reset = len(env_ids)
+        if n_reset == 0:
+            return self._get_obs(), {}
 
-        obs = self._get_obs()
-
-        # [変更] info辞書を受け取る形に修正
-        reward, info = self._compute_reward()
+        # 状態リセット
+        self.step_counts[env_ids] = 0
+        self.is_grasping[env_ids] = False
+        self.success_frame_counts[env_ids] = 0
+        self._is_success[env_ids] = False
+        self.terminated_buf[env_ids] = False
+        self.truncated_buf[env_ids] = False
         
-        # [変更] キューブが0.07以上持ち上がったかどうかの判定を削除し、_is_successフラグに変更
-        terminated = self._is_success
+        # ロボットリセット
+        qpos_reset = self.home_qpos.repeat(n_reset, 1)
+        qvel_reset = torch.zeros((n_reset, self.n_dofs), device=self.device)
+
+        # 【修正】 envs_idx= を明記して渡す
+        self.robot.set_dofs_position(qpos_reset, envs_idx=env_ids)
+        self.robot.set_dofs_velocity(qvel_reset, envs_idx=env_ids)
         
-        # [元コード流用] タイムアウト（最大ステップ到達）の判定
-        truncated = self._step_count >= self.MAX_STEPS
+        # スポンジ・コップのランダム配置 (ここだけCPUで計算してGPUに送る)
+        cup_pos_list, sponge_pos_list = [], []
+        for _ in range(n_reset):
+            while True:
+                cup_x, cup_y = np.random.uniform(self.mat_x_start, self.mat_x_start + self.mat_length), np.random.uniform(self.mat_y_start, self.mat_y_start + self.mat_width)
+                if self._is_valid_spawn_area(cup_x, cup_y): break
+            cup_pos_list.append([cup_x, cup_y, 0.015])
+            
+            while True:
+                sp_x, sp_y = np.random.uniform(self.mat_x_start, self.mat_x_start + self.mat_length), np.random.uniform(self.mat_y_start, self.mat_y_start + self.mat_width)
+                if not self._is_valid_spawn_area(sp_x, sp_y): continue
+                if np.sqrt((sp_x - cup_x)**2 + (sp_y - cup_y)**2) >= 0.06: break
+            sponge_pos_list.append([sp_x, sp_y, 0.02])
 
-        # [変更] successフラグを直接返すのではなく、info辞書を含めて返すように修正
-        return obs, reward, terminated, truncated, info
-
-    def close(self):
-        pass
-
-
-# ============================================================
-# STEP 4: リアルタイム・デモ環境クラス（show_viewer=True）
-# ============================================================
-class SO101ViewerEnv:
-    """
-    Macのビューワーでリアルタイム確認用。
-    学習済みモデルを使ってデモ再生する。
-    """
-    N_CUBES          = 5
-    CUBE_LIFT_HEIGHT = 0.07
-    ACTION_SCALE     = 0.05
-    DT               = 0.01
-
-    CUBE_X_MIN, CUBE_X_MAX = 0.05, 0.18
-    CUBE_Y_MIN, CUBE_Y_MAX = -0.25, -0.02
-
-    def __init__(self):
-        try:
-            # gs.init(backend=gs.cpu, logging_level="info")
-            gs.init(backend=gs.cuda, logging_level="warning")
-        except Exception:
-            pass
-
-        self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.DT, substeps=5),
-            viewer_options=gs.options.ViewerOptions(
-                camera_pos=(0.8, -0.8, 0.6),
-                camera_lookat=(0.15, 0.0, 0.1),
-                camera_fov=50,
-                max_FPS=60,
-            ),
-            show_viewer=True,    # ← Macビューワーを有効化
-            show_FPS=True,
-        )
-        self.scene.add_entity(gs.morphs.Plane())
-
-        try:
-            self.robot = self.scene.add_entity(
-                gs.morphs.URDF(file=URDF_PATH, pos=(0, 0, 0), fixed=True)
-            )
-        except Exception as e:
-            print(f"URDF読み込みエラー ({e})、Pandaで代替")
-            self.robot = self.scene.add_entity(
-                gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml")
-            )
-
-        colors = [
-            (1.0, 0.3, 0.3), (0.3, 1.0, 0.3), (0.3, 0.3, 1.0),
-            (1.0, 1.0, 0.3), (1.0, 0.5, 0.0),
-        ]
-        self.cubes = [
-            self.scene.add_entity(
-                material=gs.materials.Rigid(rho=300),
-                morph=gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=p, fixed=False),
-                surface=gs.surfaces.Default(color=(*c, 1.0)),
-            )
-            for p, c in zip(
-                [(0.12,-0.08,0.02),(0.12,0.08,0.02),(0.16,0.0,0.02),(0.18,-0.08,0.02),(0.18,0.08,0.02)],
-                colors,
-            )
-        ]
-
-        self.scene.build()
-        self.n_dofs = self.robot.n_dofs
-        print(f"✓ ビューワー環境構築完了 (DoF={self.n_dofs})")
-
-    def _get_eef_pos(self) -> np.ndarray:
-        try:
-            return self.robot.get_link("moving_jaw_so101_v1").get_pos().cpu().numpy()
-        except Exception:
-            return np.array([0.10, -0.15, 0.28], dtype=np.float32)
-
-    def _get_cube_positions(self) -> np.ndarray:
-        return np.stack([c.get_pos().cpu().numpy() for c in self.cubes])
-
-    def _get_obs(self) -> np.ndarray:
-        qpos      = self.robot.get_dofs_position().cpu().numpy()
-        qvel      = self.robot.get_dofs_velocity().cpu().numpy()
-        eef_pos   = self._get_eef_pos()
-        cube_poss = self._get_cube_positions()
-        dists     = np.linalg.norm(cube_poss - eef_pos, axis=1)
-        nearest   = np.array([float(np.argmin(dists))])
-        return np.concatenate([qpos, qvel, eef_pos, cube_poss.flatten(), dists, nearest]).astype(np.float32)
-
-    def reset(self, seed=None):
-        rng = np.random.default_rng(seed)
-        self.robot.set_dofs_position(np.zeros(self.n_dofs, dtype=np.float32))
-        self.robot.set_dofs_velocity(np.zeros(self.n_dofs, dtype=np.float32))
-
-        for cube in self.cubes:
-            cx = rng.uniform(self.CUBE_X_MIN, self.CUBE_X_MAX)
-            cy = rng.uniform(self.CUBE_Y_MIN, self.CUBE_Y_MAX)
-            cube.set_pos(np.array([cx, cy, 0.02], dtype=np.float32))
-            cube.set_quat(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
-
-        for _ in range(10):
-            self.scene.step()
-
-        return self._get_obs()
-
-    def step(self, action: np.ndarray):
-        current_qpos = self.robot.get_dofs_position().cpu().numpy()
-        delta        = np.clip(action, -1.0, 1.0) * self.ACTION_SCALE
-        target_qpos  = np.clip(current_qpos + delta, -np.pi, np.pi)
-        self.robot.set_dofs_position(target_qpos.astype(np.float32))
+        # 【修正】 envs_idx= を明記して渡す
+        self.cup.set_pos(torch.tensor(cup_pos_list, dtype=torch.float32, device=self.device), envs_idx=env_ids)
+        self.cup.set_quat(torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(n_reset, 1), envs_idx=env_ids)
+        
+        self.sponge.set_pos(torch.tensor(sponge_pos_list, dtype=torch.float32, device=self.device), envs_idx=env_ids)
+        self.sponge.set_quat(torch.tensor([0.7071, 0.7071, 0.0, 0.0], device=self.device).repeat(n_reset, 1), envs_idx=env_ids)
+        
+        # リセット時の安定化ステップ
         self.scene.step()
+        
+        return self._get_obs(), {}
 
-        obs       = self._get_obs()
-        cube_poss = self._get_cube_positions()
-        dists     = np.linalg.norm(cube_poss - self._get_eef_pos(), axis=1)
-        max_z     = float(cube_poss[:, 2].max())
-        success   = max_z > self.CUBE_LIFT_HEIGHT
-        return obs, success
+    def step(self, actions: torch.Tensor):
+        import time
+        t_start = time.perf_counter()
+        
+        self.step_counts += 1
+        
+        # --------------------------------------------------
+        # 1. アクション適用と物理演算の計測
+        # --------------------------------------------------
+        current_qpos = self.robot.get_dofs_position()
+        delta = torch.clamp(actions, -1.0, 1.0) * self.ACTION_SCALE
+        target_qpos = current_qpos + delta
+        target_qpos[:, self.gripper_idx] = torch.clamp(target_qpos[:, self.gripper_idx], -0.174, 1.745)
+        
+        # ※ここに先ほどの `control_dofs_position` の修正を入れても入れなくても計測は可能です。
+        # 現在のコードのまま (set_dofs_position) 計測します。
+        self.robot.set_dofs_position(target_qpos)
+        
+        self.scene.step()
+        
+        # PyTorchにGPU計算の完了を待たせる（正確な時間計測のため）
+        torch.cuda.synchronize()
+        t_phys = time.perf_counter()
+
+        # --------------------------------------------------
+        # 2. 状態取得と仮想拘束・内外判定の計測
+        # --------------------------------------------------
+        g_pos = self.robot.get_link("gripper_link").get_pos()
+        jaw_pos = self._get_jaw_pos_batched()
+        s_pos = self.sponge.get_pos()
+        
+        dx = jaw_pos[:, 0] - s_pos[:, 0]
+        dy = jaw_pos[:, 1] - s_pos[:, 1]
+        dz = jaw_pos[:, 2] - s_pos[:, 2]
+        xy_dist = torch.sqrt(dx**2 + dy**2)
+        z_dist = torch.abs(dz)
+        
+        is_close = (xy_dist <= 0.015) & (z_dist <= 0.025)
+        g_angle = target_qpos[:, self.gripper_idx]
+        is_squeezing = g_angle <= 0.20
+        
+        new_grasp_mask = (~self.is_grasping) & is_close & is_squeezing
+        self.is_grasping[new_grasp_mask] = True
+        
+        grasping_mask = self.is_grasping
+        if grasping_mask.any():
+            target_sponge_pos = jaw_pos.clone()
+            target_sponge_pos[:, 2] -= 0.015
+            current_s_pos = self.sponge.get_pos()
+            current_s_pos[grasping_mask] = target_sponge_pos[grasping_mask]
+            self.sponge.set_pos(current_s_pos)
+
+        release_mask = self.is_grasping & (g_angle > 0.35)
+        self.is_grasping[release_mask] = False
+
+        c_pos = self.cup.get_pos()
+        in_x = torch.abs(s_pos[:, 0] - c_pos[:, 0]) < 0.035
+        in_y = torch.abs(s_pos[:, 1] - c_pos[:, 1]) < 0.035
+        in_z = (s_pos[:, 2] - c_pos[:, 2] > -0.015) & (s_pos[:, 2] - c_pos[:, 2] < 0.060)
+        
+        is_in_cup = in_x & in_y & in_z & (~self.is_grasping)
+        self.success_frame_counts[is_in_cup] += 1
+        self.success_frame_counts[~is_in_cup] = 0
+        self._is_success = self.success_frame_counts >= 50
+        
+        torch.cuda.synchronize()
+        t_logic = time.perf_counter()
+
+        # --------------------------------------------------
+        # 3. 報酬計算とリセット処理の計測
+        # --------------------------------------------------
+        obs = self._get_obs()
+        reward = self._compute_reward(target_qpos)
+        
+        self.terminated_buf = self._is_success.clone()
+        self.truncated_buf = self.step_counts >= self.MAX_STEPS
+        
+        reset_ids = (self.terminated_buf | self.truncated_buf).nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_ids) > 0:
+            self.reset(env_ids=reset_ids)
+            obs = self._get_obs()
+            
+        torch.cuda.synchronize()
+        t_end = time.perf_counter()
+        
+        # --- 時間の集計と出力 ---
+        if not hasattr(self, '_profile_stats'):
+            self._profile_stats = {'phys': 0.0, 'logic': 0.0, 'reward_reset': 0.0}
+            self._profile_count = 0
+            
+        self._profile_stats['phys'] += (t_phys - t_start)
+        self._profile_stats['logic'] += (t_logic - t_phys)
+        self._profile_stats['reward_reset'] += (t_end - t_logic)
+        self._profile_count += 1
+        
+        if self._profile_count % 1000 == 0:
+            print("\n=== GPUバッチ処理時間 (1ステップ平均 / 1000歩計測) ===")
+            print(f"1. 物理演算 (scene.step 等) : {self._profile_stats['phys']/1000 * 1000:.3f} ms")
+            print(f"2. 状態判定 (仮想拘束 等)   : {self._profile_stats['logic']/1000 * 1000:.3f} ms")
+            print(f"3. 報酬・リセット処理       : {self._profile_stats['reward_reset']/1000 * 1000:.3f} ms")
+            print("========================================================\n")
+            for k in self._profile_stats: self._profile_stats[k] = 0.0
+        
+        info = {}
+        return obs, reward.unsqueeze(1), self.terminated_buf.unsqueeze(1), self.truncated_buf.unsqueeze(1), info
+    def state(self):
+        return self.obs_buf
+    def close(self): pass
+    def render(self, *args, **kwargs): pass
 
 
 # ============================================================
-# STEP 5: カスタムネットワーク
+# STEP 3: skrl エージェント・ネットワーク設定
 # ============================================================
-# ニューラルネットワークの形をPyTorchで定義するクラス 使用する関数など
-class CustomMLP(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
-        super().__init__(observation_space, features_dim)
-        n_input = observation_space.shape[0]
+class Policy(GaussianMixin, Model):
+    def __init__(self, observation_space, action_space, device, clip_actions=False,
+                 clip_log_std=True, min_log_std=-20, max_log_std=2):
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        GaussianMixin.__init__(self, clip_actions=clip_actions, clip_log_std=clip_log_std, min_log_std=min_log_std, max_log_std=max_log_std)
+
         self.net = nn.Sequential(
-            nn.Linear(n_input, 256), nn.Tanh(),
-            nn.Linear(256, 256),     nn.Tanh(),
-            nn.Linear(256, features_dim), nn.Tanh(),
+            nn.Linear(self.num_observations, 256), nn.Tanh(),
+            nn.Linear(256, 128), nn.Tanh(),
+            nn.Linear(128, self.num_actions)
+        )
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+
+    def compute(self, inputs, role):
+        states = inputs.get("states", None)
+        if states is None:
+            states = torch.zeros((1, self.num_observations), device=self.device)
+        return self.net(states), {"log_std": self.log_std_parameter}
+
+class Value(DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device, clip_actions=False):
+        Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
+        DeterministicMixin.__init__(self, clip_actions=clip_actions)
+
+        self.net = nn.Sequential(
+            nn.Linear(self.num_observations, 256), nn.Tanh(),
+            nn.Linear(256, 128), nn.Tanh(),
+            nn.Linear(128, 1)
         )
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
+    def compute(self, inputs, role):
+        states = inputs.get("states", None)
+        if states is None:
+            states = torch.zeros((1, self.num_observations), device=self.device)
+        return self.net(states), {}
 
 
 # ============================================================
-# STEP 6: 学習
+# STEP 4: 学習メイン関数
 # ============================================================
-# 学習済みモデルを保存するディレクトリを作成し、PPOで学習を実行する関数
 def train():
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl47")
-    LOG_DIR  = os.path.join(SAVE_DIR, "logs")
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    os.makedirs(LOG_DIR,  exist_ok=True)
+    print(f"\n🚀 [GPU Native Mode] 爆速バッチ環境を構築中... (N_ENVS={N_ENVS})\n")
+    
+    # 完全にPyTorch/GPUネイティブなバッチ環境を1つインスタンス化
+    env = SO101GraspEnvBatched(num_envs=N_ENVS, show_viewer=False)
+    device = env.device
 
-    N_ENVS = 4   # Mac CPUに合わせて並列数を削減（Colabの64→4）
-    print(f"\n並列環境数: {N_ENVS}  保存先: {SAVE_DIR}\n")
+    models = {
+        "policy": Policy(env.observation_space, env.action_space, device),
+        "value": Value(env.observation_space, env.action_space, device)
+    }
 
-    def make_env(env_id):
-        def _init():
-            return SO101GraspEnv(env_id=env_id)
-        return _init
+    cfg = PPO_CFG()
+    cfg.rollouts = 1024  
+    cfg.learning_epochs = 10
+    cfg.mini_batches = 4
+    cfg.discount_factor = 0.99
+    cfg.gae_lambda = 0.95
+    cfg.learning_rate = 3e-4
+    cfg.random_timesteps = 0
+    cfg.learning_starts = 0
+    cfg.timesteps = 500000
+    
+    cfg.state_preprocessor = None
+    cfg.value_preprocessor = None
+    
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "genesis_so101_rl40", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    cfg.experiment.directory = log_dir
+    cfg.experiment.experiment_name = "ppo_so101_skrl_gpu_native"
 
-    # envs = VecMonitor(DummyVecEnv([make_env(i) for i in range(N_ENVS)]), LOG_DIR)
-    envs = VecMonitor(SubprocVecEnv([make_env(i) for i in range(N_ENVS)]), LOG_DIR)
+    memory = RandomMemory(memory_size=1024, num_envs=N_ENVS, device=device)
 
-    policy_kwargs = dict(
-        features_extractor_class=CustomMLP,
-        features_extractor_kwargs=dict(features_dim=256),
-        net_arch=dict(pi=[256, 128], vf=[256, 128]),
-        activation_fn=nn.Tanh,
-    )
+    agent = PPO(models=models, memory=memory, cfg=cfg,
+                observation_space=env.observation_space, action_space=env.action_space, device=device)
 
-    model = PPO(
-        policy="MlpPolicy", env=envs,
-        learning_rate=lambda p: 3e-4 * p,
-        n_steps=2048, batch_size=256, n_epochs=10,
-        gamma=0.99, gae_lambda=0.95, clip_range=0.2,
-        ent_coef=0.005, vf_coef=0.5, max_grad_norm=0.5,
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=LOG_DIR, verbose=1, device="cpu",
-    )
+    trainer_cfg = SequentialTrainerCfg()
+    trainer_cfg.timesteps = 500000
+    trainer = SequentialTrainer(cfg=trainer_cfg, env=env, agents=agent)
+    
+    print("\n⚡ シミュレーション開始: GPUの真の力を見せます ⚡\n")
+    start_time = time.time()
+    
+    trainer.train()
+    
+    end_time = time.time()
+    fps = 500000 / (end_time - start_time)
+    print(f"\n🏁 学習完了: 500,000 steps in {end_time - start_time:.2f} sec (Average FPS: {fps:.2f})")
+    
+    save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "genesis_so101_rl40", "best_model.pt")
+    agent.save(save_path)
+    print(f"✅ モデルを保存しました: {save_path}")
 
-    checkpoint_path = os.path.join(SAVE_DIR, "best_model.zip")
-    if os.path.exists(checkpoint_path):
-        try:
-            model = PPO.load(checkpoint_path, env=envs, device="cpu")
-            # model = PPO.load(checkpoint_path, env=envs, device="cuda")
-            print(f"✓ チェックポイントをロード: {checkpoint_path}")
-        except ValueError as e:
-            print(f"⚠️ 観測空間不一致のため新規学習: {e}")
-            import shutil
-            shutil.move(checkpoint_path, checkpoint_path.replace(".zip", "_old.zip"))
+    return agent, os.path.dirname(save_path)
 
-    checkpoint_cb = CheckpointCallback(
-        save_freq=10_000, save_path=SAVE_DIR, name_prefix="ppo_so101"
-    )
-    eval_env = VecMonitor(DummyVecEnv([make_env(99)]))
-    eval_cb  = EvalCallback(
-        eval_env, best_model_save_path=SAVE_DIR, log_path=LOG_DIR,
-        eval_freq=20_000, n_eval_episodes=10, deterministic=True, render=False,
-    )
-
-    TOTAL_TIMESTEPS = 500_000
-    print(f"学習開始: {TOTAL_TIMESTEPS:,} ステップ\n")
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=[checkpoint_cb, eval_cb],
-        tb_log_name="ppo_so101",
-        reset_num_timesteps=False,
-    )
-
-    final_path = os.path.join(SAVE_DIR, "ppo_so101_final")
-    model.save(final_path)
-    print(f"\n✓ 学習完了! モデル保存: {final_path}.zip")
-
-    envs.close()
-    eval_env.close()
-    return model, SAVE_DIR
 
 
 def is_valid_spawn_area(x, y):
@@ -1634,7 +1403,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl47")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl38")
 
     # --------------------------------------------------
     # 引数なし → キーボードテレオペで環境確認
