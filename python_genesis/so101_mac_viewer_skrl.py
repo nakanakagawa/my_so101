@@ -359,7 +359,7 @@ class SO101GraspEnvBatched:
         xy_dist = torch.sqrt(dx**2 + dy**2)
         z_dist = torch.abs(dz)
         
-        is_close = (xy_dist <= 0.015) & (z_dist <= 0.025)
+        is_close = (xy_dist <= 0.020) & (z_dist <= 0.035)
         g_angle = target_qpos[:, self.gripper_idx]
         is_squeezing = g_angle <= 0.20
         

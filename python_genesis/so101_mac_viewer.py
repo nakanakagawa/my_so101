@@ -109,8 +109,8 @@ class SO101GraspEnv(gym.Env):
         self._is_success = False
 
         try:
-            # gs.init(backend=gs.cpu, logging_level="warning")
-            gs.init(backend=gs.cuda, logging_level="warning")
+            gs.init(backend=gs.cpu, logging_level="warning")
+            # gs.init(backend=gs.cuda, logging_level="warning")
         except Exception:
             pass
 
@@ -374,7 +374,7 @@ class SO101GraspEnv(gym.Env):
         # 5. 成功報酬
         # --------------------------------------------------
         # マイナスの合計値に合わせて設定
-        reward_success = 100.0 if self._is_success else 0.0
+        reward_success = 1000.0 if self._is_success else 0.0
 
         total_reward = float(reward_reach + reward_orientation + reward_gripper + reward_lift + reward_move + reward_vel + reward_success)
 
@@ -573,8 +573,8 @@ class SO101ViewerEnv:
 
     def __init__(self):
         try:
-            # gs.init(backend=gs.cpu, logging_level="info")
-            gs.init(backend=gs.cuda, logging_level="warning")
+            gs.init(backend=gs.cpu, logging_level="info")
+            # gs.init(backend=gs.cuda, logging_level="warning")
         except Exception:
             pass
 
@@ -693,16 +693,17 @@ class CustomMLP(BaseFeaturesExtractor):
 # ============================================================
 # 学習済みモデルを保存するディレクトリを作成し、PPOで学習を実行する関数
 def train():
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl47")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl52")
     LOG_DIR  = os.path.join(SAVE_DIR, "logs")
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(LOG_DIR,  exist_ok=True)
 
-    N_ENVS = 4   # Mac CPUに合わせて並列数を削減（Colabの64→4）
+    N_ENVS = 16   # Mac CPUに合わせて並列数を削減（Colabの64→4）
     print(f"\n並列環境数: {N_ENVS}  保存先: {SAVE_DIR}\n")
 
     def make_env(env_id):
         def _init():
+            time.sleep(env_id * 0.5)
             return SO101GraspEnv(env_id=env_id)
         return _init
 
@@ -718,10 +719,10 @@ def train():
 
     model = PPO(
         policy="MlpPolicy", env=envs,
-        learning_rate=lambda p: 3e-4 * p,
+        learning_rate=3e-4,
         n_steps=2048, batch_size=256, n_epochs=10,
         gamma=0.99, gae_lambda=0.95, clip_range=0.2,
-        ent_coef=0.005, vf_coef=0.5, max_grad_norm=0.5,
+        ent_coef=0.001, vf_coef=0.5, max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
         tensorboard_log=LOG_DIR, verbose=1, device="cpu",
     )
@@ -746,7 +747,7 @@ def train():
         eval_freq=20_000, n_eval_episodes=10, deterministic=True, render=False,
     )
 
-    TOTAL_TIMESTEPS = 500_000
+    TOTAL_TIMESTEPS = 1_000_000
     print(f"学習開始: {TOTAL_TIMESTEPS:,} ステップ\n")
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
@@ -1634,7 +1635,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl47")
+    SAVE_DIR = os.path.join(os.path.dirname(__file__), "genesis_so101_rl52")
 
     # --------------------------------------------------
     # 引数なし → キーボードテレオペで環境確認
